@@ -123,6 +123,8 @@ const BingoGame = () => {
 
   // Refs
   const autoIntervalRef = useRef(null);
+  // AbortController for cancelling an in-flight callNumber request
+  const callAbortControllerRef = useRef(null);
   // Precise auto-call scheduler (drift-corrected)
   const autoSchedulerRef = useRef({
     timerId: null,
@@ -146,6 +148,25 @@ const BingoGame = () => {
   const containerRef = useRef(null);
   const confettiContainerRef = useRef(null);
   const fireworksContainerRef = useRef(null);
+
+  // Abort any in-flight call when auto-call is turned off from anywhere
+  useEffect(() => {
+    if (!isAutoCall) {
+      if (callAbortControllerRef.current) {
+        try {
+          callAbortControllerRef.current.abort();
+        } catch (e) {
+          console.warn("Failed to abort call controller on auto-call off:", e);
+        }
+        callAbortControllerRef.current = null;
+      }
+      inFlightCallRef.current = false;
+      inFlightNumberRef.current = null;
+      autoSchedulerRef.current.pending = false;
+      setIsCallingNumber(false);
+    }
+    // no cleanup
+  }, [isAutoCall]);
 
   useEffect(() => {
     localStorage.setItem("bingoAutoCallSpeed", speed);
@@ -1440,12 +1461,24 @@ const BingoGame = () => {
             ];
       }
       console.log(`[handleCallNumber] Calling number: ${numberToCall}`);
-      // Mark in-flight
+      // Mark in-flight and create AbortController to allow cancellation
       inFlightCallRef.current = true;
       inFlightNumberRef.current = numberToCall;
+      // Abort previous controller if any (cleanup)
+      if (callAbortControllerRef.current) {
+        try {
+          callAbortControllerRef.current.abort();
+        } catch (e) {}
+      }
+      const controller = new AbortController();
+      callAbortControllerRef.current = controller;
       const t0 =
         typeof performance !== "undefined" ? performance.now() : Date.now();
-      const response = await callNumber(gameData._id, { number: numberToCall });
+      // pass the signal through to the hook -> service -> axios
+      const response = await callNumber(gameData._id, {
+        number: numberToCall,
+        signal: controller.signal,
+      });
       console.log(`[handleCallNumber] Response from callNumber:`, response);
       if (isAuto) {
         const t1 =
@@ -1558,6 +1591,23 @@ const BingoGame = () => {
         SoundService.playSound("winner");
       }
     } catch (error) {
+      // Handle abort/cancel specially: do not show modal or mark number
+      const isAborted =
+        error &&
+        (error.code === "ERR_CANCELED" || error.name === "CanceledError");
+      if (isAborted) {
+        // Request was cancelled (likely because auto-call was turned off). Clean up and return silently.
+        console.log("[handleCallNumber] Call aborted by controller");
+        setCallError(null);
+        // ensure we don't keep the in-flight number excluded from next picks
+        inFlightCallRef.current = false;
+        inFlightNumberRef.current = null;
+        setIsCallingNumber(false);
+        // clear controller
+        callAbortControllerRef.current = null;
+        return;
+      }
+
       let userMessage = "Failed to call number";
       if (error.message.includes("Invalid number")) {
         userMessage = `Invalid number: ${
@@ -1578,6 +1628,7 @@ const BingoGame = () => {
         userMessage = "Game not found. Please refresh.";
         navigate("/cashier-dashboard");
       }
+
       setCallError(userMessage);
       setIsErrorModalOpen(true);
       if (
@@ -1632,6 +1683,27 @@ const BingoGame = () => {
       return;
     }
     await handleCallNumber();
+  };
+
+  const handleToggleAutoCall = () => {
+    const turningOn = !isAutoCall;
+    // If turning off, abort any in-flight call
+    if (!turningOn) {
+      if (callAbortControllerRef.current) {
+        try {
+          callAbortControllerRef.current.abort();
+        } catch (e) {
+          console.warn("Failed to abort controller:", e);
+        }
+        callAbortControllerRef.current = null;
+      }
+      inFlightCallRef.current = false;
+      // Allow the in-flight number to be considered on next selection
+      inFlightNumberRef.current = null;
+      autoSchedulerRef.current.pending = false;
+      setIsCallingNumber(false);
+    }
+    setIsAutoCall(turningOn);
   };
 
   const handlePlayPause = async () => {
@@ -2674,7 +2746,7 @@ const BingoGame = () => {
                   ? "bg-[#4caf50] hover:bg-[#43a047]"
                   : "bg-[#e9744c] hover:bg-[#f0b76a]"
               } text-black border-none px-4 py-2 font-bold rounded cursor-pointer text-sm transition-colors duration-300`}
-              onClick={() => setIsAutoCall((prev) => !prev)}
+              onClick={handleToggleAutoCall}
               disabled={!gameData?._id || !isPlaying || isGameOver}
             >
               Auto Call {isAutoCall ? "On" : "Off"}

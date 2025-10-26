@@ -118,7 +118,7 @@ const gameService = {
   },
 
   // ✅ FIXED: Enhanced validation and debugging for callNumber
-  callNumber: async (gameId, number) => {
+  callNumber: async (gameId, number, signal) => {
     try {
       // ✅ Enhanced validation with detailed logging
       console.log(`[gameService.callNumber] Input validation:`, {
@@ -171,9 +171,14 @@ const gameService = {
         `[gameService.callNumber] Validated - Calling number ${parsedNumber} for game ${gameId}`
       );
 
-      const response = await API.post(`/games/${gameId}/call-number`, {
-        number: parsedNumber, // ✅ Ensure we send a clean number
-      });
+      // Pass abort signal through axios config so the request can be cancelled
+      const response = await API.post(
+        `/games/${gameId}/call-number`,
+        {
+          number: parsedNumber, // ✅ Ensure we send a clean number
+        },
+        signal ? { signal } : undefined
+      );
 
       console.log("[gameService.callNumber] Success response:", {
         message: response.data.message,

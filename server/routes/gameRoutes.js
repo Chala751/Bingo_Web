@@ -241,36 +241,39 @@ router.get(
       // Get summary data for each cashier
       const cashierSummaries = await Promise.all(
         cashiers.map(async (cashier) => {
-          // Get game statistics for this cashier
-          const games = await Game.find({ cashierId: cashier._id })
+          // Get all games for summary calculation
+          const allGames = await Game.find({ cashierId: cashier._id })
             .select(
               "gameNumber status betAmount houseFee prizePool createdAt winner"
             )
-            .sort({ createdAt: -1 })
-            .limit(50)
             .lean();
 
-          const totalGames = games.length;
-          const completedGames = games.filter(
+          const totalGames = allGames.length;
+          const completedGames = allGames.filter(
             (g) => g.status === "completed"
           ).length;
-          const activeGames = games.filter((g) => g.status === "active").length;
-          const pendingGames = games.filter(
+          const activeGames = allGames.filter(
+            (g) => g.status === "active"
+          ).length;
+          const pendingGames = allGames.filter(
             (g) => g.status === "pending"
           ).length;
 
-          const totalPrizePool = games.reduce(
+          const totalPrizePool = allGames.reduce(
             (sum, g) => sum + (g.prizePool || 0),
             0
           );
-          const totalHouseFee = games.reduce(
+          const totalHouseFee = allGames.reduce(
             (sum, g) => sum + (parseFloat(g.houseFee) || 0),
             0
           );
-          const totalWinnings = games.reduce(
+          const totalWinnings = allGames.reduce(
             (sum, g) => sum + (g.winner?.prize || 0),
             0
           );
+
+          // Get recent games (limit 10 for display)
+          const recentGames = allGames.slice(0, 10);
 
           return {
             cashier: {
@@ -288,7 +291,7 @@ router.get(
               totalHouseFee: parseFloat(totalHouseFee),
               totalWinnings: parseFloat(totalWinnings),
             },
-            recentGames: games.slice(0, 10),
+            recentGames,
           };
         })
       );

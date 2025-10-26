@@ -1,17 +1,18 @@
-// src/pages/admin/Report.js
-import React, { useState, useEffect, useMemo } from "react";
+import React, { useState, useEffect } from "react";
 import AdminLayout from "../../components/admin/AdminLayout"; // Add this import
+import { useNavigate } from "react-router-dom";
+import gameService from "../../services/game";
 import {
   getAllCashiers,
   getCashierPerformance,
   getCashierReport,
   formatCashierData,
-  getActiveCashiers,
   getAllCashierSummaries,
 } from "../../services/admin";
 // Note: axios instance is configured in services/axios; no direct API import needed here
 
 const AdminReport = () => {
+  const navigate = useNavigate();
   const [cashiers, setCashiers] = useState([]);
   const [activeCashiers, setActiveCashiers] = useState([]);
   const [allCashierSummaries, setAllCashierSummaries] = useState([]);
@@ -21,6 +22,10 @@ const AdminReport = () => {
   const [reportLoading, setReportLoading] = useState(false);
   const [error, setError] = useState(null);
   const [searchTerm, setSearchTerm] = useState("");
+  const [controlLoading, setControlLoading] = useState({}); // Per-game loading
+  const [showAlert, setShowAlert] = useState(false);
+  const [alertMessage, setAlertMessage] = useState("");
+  const [alertType, setAlertType] = useState("info");
 
   // Fetch all cashiers and summaries on component mount
   useEffect(() => {
@@ -90,19 +95,41 @@ const AdminReport = () => {
         );
 
         // Fetch both performance summary and detailed report
-        const [performance, detailedReport] = await Promise.all([
+        const [performanceRaw, detailedReportRaw] = await Promise.all([
           getCashierPerformance(selectedCashierId),
           getCashierReport(selectedCashierId),
         ]);
 
-        // Combine the data
+        // Defensive normalization: backend sometimes nests payload under `data` or uses `games` vs `recentGames`.
+        const performance = performanceRaw?.data || performanceRaw || {};
+        const detailedReport =
+          detailedReportRaw?.data || detailedReportRaw || {};
+
+        // Extract cashier and summary from performance (support multiple shapes)
+        const cashierObj =
+          performance.cashier || performance.cashier?.cashier || performance;
+        const summaryObj =
+          performance.summary || performance?.data?.summary || performance;
+
+        // Normalize recent games list from detailed report
+        const recentGamesList =
+          detailedReport.recentGames ||
+          detailedReport.games ||
+          detailedReport.recent_games ||
+          [];
+
+        const detailedReportNormalized = {
+          ...detailedReport,
+          recentGames: Array.isArray(recentGamesList) ? recentGamesList : [],
+        };
+
+        // Combine into a predictable client shape
         const combinedData = {
-          ...performance,
-          detailedReport,
-          formatted: formatCashierData(
-            performance.cashier,
-            performance.summary
-          ),
+          cashier: cashierObj,
+          summary: summaryObj,
+          performance: performance,
+          detailedReport: detailedReportNormalized,
+          formatted: formatCashierData(cashierObj, summaryObj),
         };
 
         // Validate and ensure numeric fields are properly formatted
@@ -145,6 +172,122 @@ const AdminReport = () => {
       setSelectedCashierData(null);
       setError(null);
     }
+  };
+
+  // Handle game control (pause, resume, stop)
+  const handleGameControl = async (gameId, action) => {
+    const gameIndex = selectedCashierData.detailedReport.recentGames.findIndex(
+      (g) => g._id === gameId
+    );
+    if (gameIndex === -1) {
+      showPopup("Game not found", "error");
+      return;
+    }
+
+    const previousReportData = { ...selectedCashierData };
+    const targetGame = {
+      ...selectedCashierData.detailedReport.recentGames[gameIndex],
+    };
+
+    setControlLoading((prev) => ({ ...prev, [`${gameId}-${action}`]: true }));
+
+    try {
+      let newStatus;
+      let apiCall;
+      let successMessage;
+
+      switch (action) {
+        case "play":
+          newStatus = "active";
+          apiCall = () => gameService.startGame(gameId);
+          successMessage =
+            targetGame.status === "paused"
+              ? "Game resumed successfully!"
+              : "Game started successfully!";
+          break;
+        case "pause":
+          newStatus = "paused";
+          apiCall = () => gameService.pauseGame(gameId);
+          successMessage = "Game paused successfully!";
+          break;
+        case "stop":
+          newStatus = "completed";
+          apiCall = () => gameService.finishGame(gameId);
+          successMessage = "Game stopped and completed successfully!";
+          break;
+        default:
+          throw new Error(
+            `Invalid action: ${action} for status: ${targetGame.status}`
+          );
+      }
+
+      // Optimistic UI update
+      const updatedGames = selectedCashierData.detailedReport.recentGames.map(
+        (g, idx) => (idx === gameIndex ? { ...g, status: newStatus } : g)
+      );
+      setSelectedCashierData((prev) => ({
+        ...prev,
+        detailedReport: {
+          ...prev.detailedReport,
+          recentGames: updatedGames,
+        },
+      }));
+
+      // API call
+      const result = await apiCall();
+      console.log(`[handleGameControl] ${action} response:`, result);
+
+      // Handle jackpot after stop
+      if (action === "stop" && targetGame.jackpotEnabled) {
+        try {
+          const contribution = parseFloat(targetGame.betAmount) || 0;
+          if (contribution > 0) {
+            await gameService.addJackpotContribution(gameId, contribution);
+          }
+        } catch (jackpotError) {
+          console.warn(
+            `[handleGameControl] Jackpot finalization failed: ${jackpotError.message}`
+          );
+        }
+      }
+
+      // Show success
+      showPopup(successMessage, "success");
+    } catch (error) {
+      // Use structured error from API if exists
+      const errMessage =
+        error.response?.data?.message || error.message || "Unknown error";
+
+      console.error(
+        `[handleGameControl] Error ${action}ing game ${gameId}:`,
+        errMessage
+      );
+
+      // Rollback UI
+      setSelectedCashierData(previousReportData);
+
+      showPopup(`Failed to ${action} game: ${errMessage}`, "error");
+    } finally {
+      setControlLoading((prev) => {
+        const newState = { ...prev };
+        delete newState[`${gameId}-${action}`];
+        return newState;
+      });
+    }
+  };
+
+  const handleViewGame = (gameId) => {
+    navigate(`/bingo-game?id=${gameId}`);
+  };
+
+  const showPopup = (message, type = "info") => {
+    setAlertMessage(message);
+    setAlertType(type);
+    setShowAlert(true);
+  };
+
+  const hidePopup = () => {
+    setShowAlert(false);
   };
 
   // Filter cashiers based on search term
@@ -724,25 +867,31 @@ const AdminReport = () => {
                           <thead className="bg-gray-50">
                             <tr>
                               <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
-                                Game #
+                                #
+                              </th>
+                              <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
+                                Date
+                              </th>
+                              <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
+                                Pattern
+                              </th>
+                              <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
+                                Bet Amount
+                              </th>
+                              <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
+                                House %
+                              </th>
+                              <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
+                                House Fee
+                              </th>
+                              <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
+                                Prize Pool
                               </th>
                               <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
                                 Status
                               </th>
                               <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
-                                Pattern
-                              </th>
-                              <th className="px-6 py-3 text-right text-xs font-medium text-gray-500 uppercase tracking-wider">
-                                Bet Amount
-                              </th>
-                              <th className="px-6 py-3 text-right text-xs font-medium text-gray-500 uppercase tracking-wider">
-                                House Fee
-                              </th>
-                              <th className="px-6 py-3 text-right text-xs font-medium text-gray-500 uppercase tracking-wider">
-                                Prize
-                              </th>
-                              <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
-                                Date
+                                Actions
                               </th>
                             </tr>
                           </thead>
@@ -753,6 +902,31 @@ const AdminReport = () => {
                                   <td className="px-6 py-4 whitespace-nowrap text-sm font-medium text-gray-900">
                                     #{game.gameNumber}
                                   </td>
+                                  <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-500">
+                                    {new Date(
+                                      game.createdAt
+                                    ).toLocaleDateString()}
+                                  </td>
+                                  <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-500">
+                                    {game.pattern}
+                                  </td>
+                                  <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-500">
+                                    {game.betAmount} Birr
+                                  </td>
+                                  <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-500">
+                                    {game.houseFeePercentage}%
+                                  </td>
+                                  <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-500">
+                                    <span className="text-green-600 font-medium">
+                                      {parseFloat(game.houseFee || 0).toFixed(
+                                        2
+                                      )}{" "}
+                                      Birr
+                                    </span>
+                                  </td>
+                                  <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-500">
+                                    {game.prizePool} Birr
+                                  </td>
                                   <td className="px-6 py-4 whitespace-nowrap">
                                     <span
                                       className={`inline-flex px-2 py-1 text-xs font-semibold rounded-full ${
@@ -760,30 +934,62 @@ const AdminReport = () => {
                                           ? "bg-green-100 text-green-800"
                                           : game.status === "active"
                                           ? "bg-blue-100 text-blue-800"
-                                          : "bg-yellow-100 text-yellow-800"
+                                          : game.status === "paused"
+                                          ? "bg-yellow-100 text-yellow-800"
+                                          : "bg-gray-100 text-gray-800"
                                       }`}
                                     >
                                       {game.status}
                                     </span>
                                   </td>
-                                  <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-500">
-                                    {game.pattern}
-                                  </td>
-                                  <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-500 text-right">
-                                    {formatBirr(game.betAmount)} Br
-                                  </td>
-                                  <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-500 text-right">
-                                    <span className="text-green-600 font-medium">
-                                      {formatBirr(game.houseFee)} Br
-                                    </span>
-                                  </td>
-                                  <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-500 text-right">
-                                    {formatBirr(game.winner?.prize || 0)} Br
-                                  </td>
-                                  <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-500">
-                                    {new Date(
-                                      game.createdAt
-                                    ).toLocaleDateString()}
+                                  <td className="px-6 py-4 whitespace-nowrap text-sm font-medium">
+                                    <div className="flex gap-2">
+                                      <button
+                                        onClick={() => handleViewGame(game._id)}
+                                        className="bg-blue-600 hover:bg-blue-700 text-white px-3 py-1 rounded text-xs transition-colors"
+                                      >
+                                        View
+                                      </button>
+                                      {game.status === "active" && (
+                                        <>
+                                          <button
+                                            onClick={() =>
+                                              handleGameControl(
+                                                game._id,
+                                                "pause"
+                                              )
+                                            }
+                                            className="bg-yellow-600 hover:bg-yellow-700 text-white px-3 py-1 rounded text-xs transition-colors"
+                                          >
+                                            Pause
+                                          </button>
+                                          <button
+                                            onClick={() =>
+                                              handleGameControl(
+                                                game._id,
+                                                "stop"
+                                              )
+                                            }
+                                            className="bg-red-600 hover:bg-red-700 text-white px-3 py-1 rounded text-xs transition-colors"
+                                          >
+                                            Stop
+                                          </button>
+                                        </>
+                                      )}
+                                      {(game.status === "pending" ||
+                                        game.status === "paused") && (
+                                        <button
+                                          onClick={() =>
+                                            handleGameControl(game._id, "play")
+                                          }
+                                          className="bg-green-600 hover:bg-green-700 text-white px-3 py-1 rounded text-xs transition-colors"
+                                        >
+                                          {game.status === "paused"
+                                            ? "Resume"
+                                            : "Play"}
+                                        </button>
+                                      )}
+                                    </div>
                                   </td>
                                 </tr>
                               )
@@ -814,6 +1020,38 @@ const AdminReport = () => {
             )}
           </div>
         </div>
+
+        {/* Popup Modal */}
+        {showAlert && (
+          <div className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50">
+            <div className="bg-white dark:bg-gray-800 p-6 rounded-lg shadow-xl max-w-md w-full mx-4">
+              <h3
+                className={`text-lg font-semibold mb-4 ${
+                  alertType === "success"
+                    ? "text-green-600 dark:text-green-400"
+                    : alertType === "error"
+                    ? "text-red-600 dark:text-red-400"
+                    : "text-gray-900 dark:text-gray-100"
+                }`}
+              >
+                {alertType === "success"
+                  ? "Success"
+                  : alertType === "error"
+                  ? "Error"
+                  : "Notification"}
+              </h3>
+              <p className="text-gray-600 dark:text-gray-300 mb-4">
+                {alertMessage}
+              </p>
+              <button
+                onClick={hidePopup}
+                className="bg-blue-600 hover:bg-blue-700 text-white px-4 py-2 rounded-md"
+              >
+                OK
+              </button>
+            </div>
+          </div>
+        )}
       </div>
     </AdminLayout>
   );

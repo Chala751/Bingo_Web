@@ -403,18 +403,36 @@ const CashierReport = () => {
         startDate: effStartDate,
         endDate: effEndDate,
       };
-      const data = await gameService.getCashierReport(cashierId, serverFilters);
-      console.log("[fetchReportData] Report data:", data);
-      if (!data || !Array.isArray(data.games)) {
-        throw new Error(data.message || "Invalid report data format");
-      }
+      const dataRaw = await gameService.getCashierReport(
+        cashierId,
+        serverFilters
+      );
+      console.log("[fetchReportData] Report data (raw):", dataRaw);
+
+      // Defensive normalization: backend may return payload directly or under `data`
+      const payload = dataRaw?.data || dataRaw || {};
+
+      // Support both `games` and `games` nested under other keys
+      const games = Array.isArray(payload.games)
+        ? payload.games
+        : Array.isArray(payload.data?.games)
+        ? payload.data.games
+        : [];
+
+      // Fallbacks for numeric aggregates
+      const totalGames =
+        payload.totalGames ?? payload.count ?? games.length ?? 0;
+      const activeGames = payload.activeGames ?? 0;
+      const totalHouseFee =
+        payload.totalHouseFee ?? payload.totalHouseFeeFormatted ?? "0.00";
+
       setReportData({
-        totalGames: data.totalGames || 0,
-        activeGames: data.activeGames || 0,
-        totalHouseFee: data.totalHouseFee || "0.00",
-        games: data.games,
-        counters: data.counters || [],
-        results: data.results || [],
+        totalGames: Number(totalGames) || 0,
+        activeGames: Number(activeGames) || 0,
+        totalHouseFee: totalHouseFee || "0.00",
+        games: games,
+        counters: payload.counters || [],
+        results: payload.results || [],
       });
 
       // Handle jackpot fetch separately to avoid failing the entire report
