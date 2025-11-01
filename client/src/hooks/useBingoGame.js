@@ -33,12 +33,12 @@ export const useBingoGame = () => {
       throw new Error("Invalid game ID");
     }
     try {
-      // Forward optional AbortSignal (data.signal) to the service so callers can cancel
-      const response = await gameService.callNumber(
-        gameId,
-        data.number,
-        data?.signal
-      );
+      // Forward optional AbortSignal and control flags to the service so callers can cancel and enforce
+      const response = await gameService.callNumber(gameId, data.number, {
+        signal: data?.signal,
+        requestId: data?.requestId,
+        enforce: data?.enforce === true,
+      });
       if (!response || !response.game) {
         throw new Error("No game data in response from call number");
       }

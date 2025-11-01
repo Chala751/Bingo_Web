@@ -39,6 +39,11 @@ export const callNumber = async (req, res, next) => {
     // Optional idempotency key to survive network retries/aborts
     const requestId =
       req.headers["x-request-id"] || req.body?.requestId || null;
+    // If the client is resuming an interrupted/manual number, it can enforce
+    // that exact number must be used; otherwise the server should not call a
+    // different number in this tick.
+    const enforceRequested =
+      req.body?.enforce === true || req.body?.mustMatch === true;
 
     if (!gameId) {
       return res.status(400).json({ message: "Game ID is required" });
@@ -131,15 +136,48 @@ export const callNumber = async (req, res, next) => {
 
     // --- Manual override (honor requested number if valid and not called) ---
     const requestedNumber = Number(req.body?.number);
-    if (
-      !isNaN(requestedNumber) &&
-      requestedNumber >= 1 &&
-      requestedNumber <= 75 &&
-      !calledNumbersCopy.includes(requestedNumber)
-    ) {
+    const hasRequested = !isNaN(requestedNumber);
+    const requestedValid =
+      hasRequested && requestedNumber >= 1 && requestedNumber <= 75;
+    const alreadyCalled = calledNumbersCopy.includes(requestedNumber);
+    if (requestedValid && !alreadyCalled) {
       nextNumber = requestedNumber;
       callSource = "manual";
       isUsingForcedSequence = false; // manual takes precedence
+    }
+
+    // If the client explicitly enforces a requested number and it's not usable
+    // (invalid or already called), do NOT pick a different number.
+    if (enforceRequested && (!requestedValid || alreadyCalled)) {
+      // Release the lock before returning
+      await Game.findByIdAndUpdate(gameId, { $unset: { callLock: "" } });
+      const safeGame = await Game.findById(gameId)
+        .select(
+          "gameNumber status calledNumbers calledNumbersLog forcedCallIndex pattern forcedPattern moderatorWinnerCardId prizePool"
+        )
+        .lean();
+      await GameLog.create({
+        gameId,
+        action: "callNumber",
+        status: "rejected",
+        details: {
+          requestId,
+          requestedNumber,
+          reason: requestedValid
+            ? "requested number already called"
+            : "requested number invalid",
+          enforce: true,
+          timestamp: new Date(),
+        },
+      });
+      return res.status(412).json({
+        message: "Requested number cannot be honored",
+        errorCode: "REQUESTED_NUMBER_REJECTED",
+        reason: requestedValid
+          ? "ALREADY_CALLED"
+          : "INVALID_NUMBER",
+        game: safeGame,
+      });
     }
 
     // --- Random number if no forced/manual number ---

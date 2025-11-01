@@ -1623,8 +1623,8 @@ const BingoGame = () => {
         pendingServerCallsRef.current = (
           pendingServerCallsRef.current || []
         ).filter((n) => n !== intNum);
-        // Re-enter handleCallNumber as a manual request so normal networking path runs
-        return await handleCallNumber(intNum, options);
+        // Re-enter handleCallNumber as a manual request with enforcement so normal networking path runs
+        return await handleCallNumber(intNum, { ...options, enforce: true });
       } catch (e) {
         console.error("Error scheduling interrupted number with server:", e);
       }
@@ -1773,9 +1773,15 @@ const BingoGame = () => {
       const t0 =
         typeof performance !== "undefined" ? performance.now() : Date.now();
       // pass the signal through to the hook -> service -> axios
+      // Generate a requestId for idempotency; crypto.randomUUID is available in modern browsers
+      const requestId =
+        (typeof crypto !== "undefined" && crypto.randomUUID && crypto.randomUUID()) ||
+        `${Date.now()}-${Math.random().toString(36).slice(2)}`;
       const response = await callNumber(gameData._id, {
         number: numberToCall,
         signal: controller.signal,
+        requestId,
+        enforce: options?.enforce === true,
       });
       // If another call started after this one, treat this as a late/aborted
       // response. Enqueue the server-called number so it is applied before any
@@ -1943,6 +1949,39 @@ const BingoGame = () => {
         inFlightNumberRef.current = null;
         setIsCallingNumber(false);
         // clear controller
+        callAbortControllerRef.current = null;
+        return;
+      }
+
+      // If we enforced a specific number (from an interrupt) and the server
+      // rejected it (e.g., already called), do NOT accept a different number
+      // in this tick. Preserve the number to retry next tick and exit quietly.
+      if (error?.response?.status === 412) {
+        if (manualNum != null) {
+          try {
+            interruptedNumberRef.current = manualNum;
+            interruptedNumbersSetRef.current.add(manualNum);
+            console.warn(
+              `[handleCallNumber] Server rejected enforced number ${manualNum}; preserving for next tick. Reason: ${error?.response?.data?.reason}`
+            );
+          } catch {}
+        }
+        // Clear in-flight markers and exit without showing error modal
+        inFlightCallRef.current = false;
+        inFlightNumberRef.current = null;
+        setIsCallingNumber(false);
+        callAbortControllerRef.current = null;
+        return;
+      }
+
+      // If another call is in progress on the server, treat as a transient
+      // contention and let the next scheduler tick retry.
+      if (error?.code === "CALL_IN_PROGRESS" || error?.response?.status === 409) {
+        console.warn("[handleCallNumber] Server indicates a call is in progress; will retry on next tick");
+        skipNextCallRef.current = false; // allow next tick
+        inFlightCallRef.current = false;
+        inFlightNumberRef.current = null;
+        setIsCallingNumber(false);
         callAbortControllerRef.current = null;
         return;
       }

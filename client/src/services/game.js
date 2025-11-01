@@ -118,8 +118,15 @@ const gameService = {
   },
 
   // ✅ FIXED: Enhanced validation and debugging for callNumber
-  callNumber: async (gameId, number, signal) => {
+  // Supports (gameId, number, options) where options can include { signal, requestId, enforce, retryOn409 }
+  callNumber: async (gameId, number, options) => {
     try {
+      const isSignal =
+        typeof options !== "undefined" &&
+        options &&
+        typeof options === "object" &&
+        (typeof options.aborted === "boolean" || options instanceof AbortSignal);
+      const opts = isSignal ? { signal: options } : options || {};
       // ✅ Enhanced validation with detailed logging
       console.log(`[gameService.callNumber] Input validation:`, {
         gameId,
@@ -173,16 +180,19 @@ const gameService = {
 
       // Pass abort signal through axios config so the request can be cancelled
       // Use requestWithRetry if available to survive transient network issues
+      const requestId = opts?.requestId || null;
+      const enforce = opts?.enforce === true;
       const requestConfig = {
         method: "post",
         url: `/games/${gameId}/call-number`,
-        data: { number: parsedNumber },
+        data: { number: parsedNumber, requestId, enforce },
+        headers: requestId ? { "x-request-id": requestId } : undefined,
       };
       const retryOptions = {
         retries: 2,
         backoff: 300,
         timeout: 10000,
-        signal,
+        signal: opts?.signal,
       };
       let response;
       if (API.requestWithRetry) {
@@ -190,8 +200,15 @@ const gameService = {
       } else {
         response = await API.post(
           `/games/${gameId}/call-number`,
-          { number: parsedNumber },
-          signal ? { signal } : undefined
+          { number: parsedNumber, requestId, enforce },
+          opts?.signal
+            ? {
+                signal: opts.signal,
+                headers: requestId ? { "x-request-id": requestId } : undefined,
+              }
+            : requestId
+            ? { headers: { "x-request-id": requestId } }
+            : undefined
         );
       }
 
@@ -209,6 +226,16 @@ const gameService = {
       // Return the full response data so the component can access all fields
       return response.data;
     } catch (error) {
+      // Lightweight handling for optimistic concurrency: if another call is in progress, allow caller to decide
+      if (error?.response?.status === 409) {
+        // surface a structured error so callers can retry/backoff
+        const err = new Error(
+          error.response?.data?.message || "Call in progress"
+        );
+        err.code = "CALL_IN_PROGRESS";
+        err.response = error.response;
+        throw err;
+      }
       // Check if the request was canceled (aborted).
       // Different axios/browser combinations may surface this as
       // error.code, error.name or simply error.message === 'canceled'
