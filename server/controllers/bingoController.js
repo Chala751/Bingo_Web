@@ -36,25 +36,80 @@ export const getCard = async (req, res) => {
 export const callNumber = async (req, res, next) => {
   try {
     const { gameId } = req.params;
+    // Optional idempotency key to survive network retries/aborts
+    const requestId =
+      req.headers["x-request-id"] || req.body?.requestId || null;
 
     if (!gameId) {
       return res.status(400).json({ message: "Game ID is required" });
     }
 
-    // Load only essential fields
-    const game = await Game.findById(gameId)
+    // If an idempotent requestId is provided and we've processed it before,
+    // return the previous result to avoid duplicate state/log writes.
+    if (requestId) {
+      const previous = await GameLog.findOne({
+        gameId,
+        action: "callNumber",
+        "details.requestId": requestId,
+      })
+        .sort({ _id: -1 })
+        .lean();
+      if (previous) {
+        // Return the current game state and the previously called number
+        const safeGame = await Game.findById(gameId)
+          .select(
+            "gameNumber status calledNumbers calledNumbersLog forcedCallIndex pattern forcedPattern moderatorWinnerCardId prizePool"
+          )
+          .lean();
+        return res.json({
+          game: safeGame,
+          calledNumber: previous.details?.calledNumber || null,
+          callSource: previous.details?.type || "idempotent",
+          isUsingForcedSequence: previous.details?.type === "forced",
+          patternUsed: safeGame?.forcedPattern || safeGame?.pattern,
+          forcedCallIndex: safeGame?.forcedCallIndex || 0,
+          forcedCallSequenceLength: safeGame?.forcedCallLength || 0,
+          idempotent: true,
+        });
+      }
+    }
+
+    // Try to acquire a short lock to ensure only one call is processed at a time.
+    // Uses a soft TTL to avoid deadlocks if a request crashes.
+    const lockTTLms = 3000;
+    const lockUntil = new Date(Date.now() + lockTTLms);
+    const lockDoc = await Game.findOneAndUpdate(
+      {
+        _id: gameId,
+        status: "active",
+        $or: [{ callLock: { $exists: false } }, { callLock: { $lte: new Date() } }],
+      },
+      { $set: { callLock: lockUntil } },
+      { new: true }
+    )
       .select(
-        "gameNumber status calledNumbers calledNumbersLog forcedCallSequence forcedCallIndex pattern forcedPattern moderatorWinnerCardId prizePool"
+        "gameNumber status calledNumbers calledNumbersLog forcedCallSequence forcedCallIndex pattern forcedPattern moderatorWinnerCardId prizePool callLock"
       )
       .lean();
+
+    if (!lockDoc) {
+      // Another call is in progress; ask client to retry shortly (backoff)
+      return res.status(409).json({
+        message: "Another call is currently being processed. Please retry.",
+        errorCode: "CALL_IN_PROGRESS",
+      });
+    }
+
+  // Load only essential fields (from the doc we just locked)
+    const game = lockDoc;
 
     if (!game) return res.status(404).json({ message: "Game not found" });
     if (game.status !== "active")
       return res.status(400).json({ message: `Game is ${game.status}` });
 
-    let nextNumber;
-    let callSource = "random";
-    let isUsingForcedSequence = false;
+  let nextNumber;
+  let callSource = "random";
+  let isUsingForcedSequence = false;
 
     const calledNumbersCopy = game.calledNumbers || [];
     const callsMade = calledNumbersCopy.length;
@@ -74,7 +129,20 @@ export const callNumber = async (req, res, next) => {
       }
     }
 
-    // --- Random number if no forced number ---
+    // --- Manual override (honor requested number if valid and not called) ---
+    const requestedNumber = Number(req.body?.number);
+    if (
+      !isNaN(requestedNumber) &&
+      requestedNumber >= 1 &&
+      requestedNumber <= 75 &&
+      !calledNumbersCopy.includes(requestedNumber)
+    ) {
+      nextNumber = requestedNumber;
+      callSource = "manual";
+      isUsingForcedSequence = false; // manual takes precedence
+    }
+
+    // --- Random number if no forced/manual number ---
     if (!nextNumber) {
       const remainingNumbers = Array.from(
         { length: 75 },
@@ -93,14 +161,49 @@ export const callNumber = async (req, res, next) => {
       callSource = "random";
     }
 
+    // Idempotency/duplicate guard: if the number is already in calledNumbers,
+    // return the current game state without pushing duplicate logs or indexes.
+    if (calledNumbersCopy.includes(nextNumber)) {
+      // Release the lock before returning
+      await Game.findByIdAndUpdate(gameId, { $unset: { callLock: "" } });
+      const safeGame = await Game.findById(gameId)
+        .select(
+          "gameNumber status calledNumbers calledNumbersLog forcedCallIndex pattern forcedPattern moderatorWinnerCardId prizePool"
+        )
+        .lean();
+      await GameLog.create({
+        gameId,
+        action: "callNumber",
+        status: "duplicate",
+        details: {
+          requestId,
+          calledNumber: nextNumber,
+          type: callSource,
+          note: "Number already called — returning without mutation",
+          timestamp: new Date(),
+        },
+      });
+      return res.json({
+        game: safeGame,
+        calledNumber: nextNumber,
+        callSource: callSource,
+        isUsingForcedSequence,
+        patternUsed: game.forcedPattern || game.pattern,
+        forcedCallIndex: safeGame.forcedCallIndex,
+        forcedCallSequenceLength: game.forcedCallSequence?.length || 0,
+        duplicate: true,
+      });
+    }
+
     // --- Atomic update to prevent duplicate numbers ---
+    // Use two-step logic to avoid duplicate log entries if the number was added in between
     const updateData = {
       $addToSet: { calledNumbers: nextNumber }, // ensures uniqueness
-      $push: { calledNumbersLog: { number: nextNumber, calledAt: new Date() } },
+      // Only increment forcedCallIndex when actually using forced sequence AND this is a fresh add
       ...(isUsingForcedSequence ? { $inc: { forcedCallIndex: 1 } } : {}),
     };
 
-    const updatedGame = await Game.findByIdAndUpdate(gameId, updateData, {
+    const afterAdd = await Game.findByIdAndUpdate(gameId, updateData, {
       new: true,
       runValidators: true,
     })
@@ -109,12 +212,33 @@ export const callNumber = async (req, res, next) => {
       )
       .lean();
 
+    // Only push a log row if our add actually resulted in the number present as the latest call
+    let doPushLog = false;
+    if (afterAdd?.calledNumbers?.includes(nextNumber)) {
+      doPushLog = true;
+    }
+
+    let updatedGame = afterAdd;
+    if (doPushLog) {
+      const pushLogUpdate = await Game.findByIdAndUpdate(
+        gameId,
+        { $push: { calledNumbersLog: { number: nextNumber, calledAt: new Date() } } },
+        { new: true, runValidators: true }
+      )
+        .select(
+          "gameNumber status calledNumbers calledNumbersLog forcedCallIndex pattern forcedPattern moderatorWinnerCardId prizePool"
+        )
+        .lean();
+      updatedGame = pushLogUpdate || afterAdd;
+    }
+
     // --- Log the action ---
     await GameLog.create({
       gameId,
       action: "callNumber",
       status: "success",
       details: {
+        requestId,
         calledNumber: nextNumber,
         type: callSource,
         forcedCallIndex: updatedGame.forcedCallIndex,
@@ -133,10 +257,21 @@ export const callNumber = async (req, res, next) => {
       patternUsed: game.forcedPattern || game.pattern,
       forcedCallIndex: updatedGame.forcedCallIndex,
       forcedCallSequenceLength: game.forcedCallSequence?.length || 0,
+      idempotent: false,
     });
   } catch (err) {
     console.error("[callNumber] ❌ ERROR:", err);
     return res.status(500).json({ message: "Internal server error" });
+  } finally {
+    // Ensure the call lock is released in all cases
+    const { gameId } = req.params || {};
+    if (gameId) {
+      try {
+        await Game.findByIdAndUpdate(gameId, { $unset: { callLock: "" } });
+      } catch (e) {
+        console.warn("[callNumber] Failed to release call lock:", e?.message);
+      }
+    }
   }
 };
 

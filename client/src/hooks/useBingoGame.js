@@ -46,10 +46,11 @@ export const useBingoGame = () => {
       setError(null);
       return response;
     } catch (error) {
+      // Preserve original error so callers can detect abort/cancel (e.g. ERR_CANCELED)
       const errorMessage =
         error.response?.data?.error || error.message || "Failed to call number";
       setError(errorMessage);
-      throw new Error(errorMessage);
+      throw error; // rethrow original error (do not wrap)
     }
   }, []);
 

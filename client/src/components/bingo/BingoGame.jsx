@@ -19,6 +19,10 @@ const BingoGame = () => {
     useContext(LanguageContext);
   const { game, fetchGame, callNumber, checkBingo, finishGame, error } =
     useBingoGame();
+  // Track online/offline status to gracefully handle slow networks
+  const [isOnline, setIsOnline] = useState(
+    typeof navigator !== "undefined" ? navigator.onLine : true
+  );
   const [searchParams] = useSearchParams();
 
   // Game state
@@ -125,6 +129,21 @@ const BingoGame = () => {
   const autoIntervalRef = useRef(null);
   // AbortController for cancelling an in-flight callNumber request
   const callAbortControllerRef = useRef(null);
+  // If a call is aborted/interrupted, store the number so the next
+  // manual "Next" or the auto-tick will prefer to call it (or apply it)
+  const interruptedNumberRef = useRef(null);
+  // Set of interrupted numbers we are preserving to avoid enqueuing/applying
+  // late server responses for them (prevents duplicates).
+  const interruptedNumbersSetRef = useRef(new Set());
+  // Sequence number to identify a specific call attempt. Incrementing this
+  // invalidates any previously-started call so late responses are ignored.
+  const callSequenceRef = useRef(0);
+  // If the server returns a called number for a previous (aborted/late) request,
+  // we enqueue it here so it can be applied before any newly-sequenced call.
+  const pendingServerCallsRef = useRef([]);
+  // When a late response arrives and we want to ensure the next local call is
+  // deferred to the following tick, set this flag.
+  const skipNextCallRef = useRef(false);
   // Precise auto-call scheduler (drift-corrected)
   const autoSchedulerRef = useRef({
     timerId: null,
@@ -139,15 +158,23 @@ const BingoGame = () => {
   const numberIndexRef = useRef(new Map());
   // Fast membership cache for called numbers
   const calledNumbersSetRef = useRef(new Set());
+  // Track numbers we've applied to card marks to prevent re-applying
+  const appliedNumbersRef = useRef(new Set());
   // Guard to prevent overlapping card checks
   const checkInFlightRef = useRef(false);
   // Adaptive network/audio lead time (ms) based on measured RTT
   const adaptiveLeadMsRef = useRef(null);
   const autoModeRef = useRef(false);
   const lastPrizePoolUpdateRef = useRef(0);
+  // Flag to ignore late responses when auto-call is toggled off
+  const ignoreLateResponsesRef = useRef(false);
+  const recentlyAbortedRef = useRef(false);
   const containerRef = useRef(null);
   const confettiContainerRef = useRef(null);
   const fireworksContainerRef = useRef(null);
+
+  // Simple prefixed logger for easier filtering in console
+  const bgLog = (...args) => console.log("[bingo game]", ...args);
 
   // Abort any in-flight call when auto-call is turned off from anywhere
   useEffect(() => {
@@ -159,14 +186,216 @@ const BingoGame = () => {
           console.warn("Failed to abort call controller on auto-call off:", e);
         }
         callAbortControllerRef.current = null;
+        // Invalidate any in-flight call: bump sequence so late responses are ignored
+        try {
+          callSequenceRef.current = (callSequenceRef.current || 0) + 1;
+        } catch (e) {}
       }
       inFlightCallRef.current = false;
       inFlightNumberRef.current = null;
       autoSchedulerRef.current.pending = false;
       setIsCallingNumber(false);
+      // Ignore late responses for aborted calls to prevent double-marking
+      ignoreLateResponsesRef.current = true;
     }
     // no cleanup
   }, [isAutoCall]);
+
+  // Listen for online/offline events and handle transitions
+  useEffect(() => {
+    const onOnline = () => {
+      setIsOnline(true);
+    };
+    const onOffline = () => {
+      setIsOnline(false);
+      // If we go offline, stop auto-calling and abort any in-flight request
+      try {
+        setIsAutoCall(false);
+        if (callAbortControllerRef.current)
+          callAbortControllerRef.current.abort();
+      } catch (e) {}
+    };
+    window.addEventListener("online", onOnline);
+    window.addEventListener("offline", onOffline);
+    return () => {
+      window.removeEventListener("online", onOnline);
+      window.removeEventListener("offline", onOffline);
+    };
+  }, []);
+
+  // Idempotent helper to apply a called number to state (prevents double-marking)
+  const applyCalledNumber = (num) => {
+    try {
+      bgLog("applyCalledNumber", num);
+    } catch (e) {}
+    // Delegate to centralized marking function for consistency and to avoid
+    // race conditions between multiple code paths that update marks.
+    try {
+      const n = Number(num);
+      if (!n || isNaN(n)) return false;
+      return markNumberPositions(n);
+    } catch (e) {
+      console.error("applyCalledNumber error:", e);
+      return false;
+    }
+  };
+
+  // Centralized marking helper: marks positions for a called number using the
+  // precomputed numberIndexRef when available. Rebuilds index from current
+  // bingoCards if index is missing or doesn't contain the number. Ensures
+  // idempotency via appliedNumbersRef and calledNumbersSetRef.
+  const markNumberPositions = (n) => {
+    try {
+      try {
+        bgLog("markNumberPositions applying", n);
+      } catch (e) {}
+      if (appliedNumbersRef.current.has(n)) {
+        console.log(`[markNumberPositions] ${n} already applied, skipping`);
+        return false;
+      }
+      console.log(
+        `[markNumberPositions] applying ${n}. calledNumbersSet size=${calledNumbersSetRef.current?.size}`
+      );
+
+      // Ensure calledNumbersSet contains n
+      calledNumbersSetRef.current.add(n);
+
+      // Find positions via index; if missing, rebuild index from bingoCards
+      let entries = numberIndexRef.current?.get(n) || [];
+      if (
+        (!entries || entries.length === 0) &&
+        bingoCards &&
+        bingoCards.length
+      ) {
+        // Rebuild index conservatively from current bingoCards
+        const idx = new Map();
+        for (const card of bingoCards) {
+          const letters = ["B", "I", "N", "G", "O"];
+          for (let col = 0; col < 5; col++) {
+            for (let row = 0; row < 5; row++) {
+              const letter = letters[col];
+              const num = card.numbers?.[letter]?.[row];
+              if (typeof num === "number") {
+                if (!idx.has(num)) idx.set(num, []);
+                idx.get(num).push({ cardId: card.id, letter, row });
+              }
+            }
+          }
+        }
+        numberIndexRef.current = idx;
+        entries = idx.get(n) || [];
+        console.log(
+          `[markNumberPositions] rebuilt index; entries for ${n}:`,
+          entries
+        );
+      }
+
+      // If still no entries, fall back to scanning cards for positions
+      if (!entries || entries.length === 0) {
+        const found = [];
+        for (const card of bingoCards) {
+          const letters = ["B", "I", "N", "G", "O"];
+          for (let col = 0; col < 5; col++) {
+            for (let row = 0; row < 5; row++) {
+              const letter = letters[col];
+              if (card.numbers?.[letter]?.[row] === n) {
+                found.push({ cardId: card.id, letter, row });
+              }
+            }
+          }
+        }
+        entries = found;
+        if (found.length) {
+          // merge into index for future
+          const idx = numberIndexRef.current || new Map();
+          if (!idx.has(n)) idx.set(n, found);
+          numberIndexRef.current = idx;
+        }
+        console.log(
+          `[markNumberPositions] fallback scan entries for ${n}:`,
+          entries
+        );
+      }
+
+      // Apply marks to affected cards
+      if (entries && entries.length) {
+        const affected = new Map();
+        for (const pos of entries) {
+          const id = pos.cardId;
+          const base = bingoCards.find((c) => c.id === id);
+          if (!base) continue;
+          if (!affected.has(id)) {
+            affected.set(id, {
+              ...base,
+              markedPositions: {
+                B: base.markedPositions?.B?.slice() || [
+                  false,
+                  false,
+                  false,
+                  false,
+                  false,
+                ],
+                I: base.markedPositions?.I?.slice() || [
+                  false,
+                  false,
+                  false,
+                  false,
+                  false,
+                ],
+                N: base.markedPositions?.N?.slice() || [
+                  false,
+                  true,
+                  false,
+                  false,
+                  false,
+                ],
+                G: base.markedPositions?.G?.slice() || [
+                  false,
+                  false,
+                  false,
+                  false,
+                  false,
+                ],
+                O: base.markedPositions?.O?.slice() || [
+                  false,
+                  false,
+                  false,
+                  false,
+                  false,
+                ],
+              },
+            });
+          }
+          const upd = affected.get(id);
+          if (!upd.markedPositions[pos.letter][pos.row]) {
+            upd.markedPositions[pos.letter][pos.row] = true;
+          }
+        }
+        if (affected.size > 0) {
+          setBingoCards((prev) =>
+            prev.map((c) => (affected.has(c.id) ? affected.get(c.id) : c))
+          );
+          setCards((prev) =>
+            prev.map((c) => (affected.has(c.id) ? affected.get(c.id) : c))
+          );
+        }
+      }
+
+      // Mark applied and update UI lists/sound
+      appliedNumbersRef.current.add(n);
+      setCalledNumbers((prev) => (prev.includes(n) ? prev : [...prev, n]));
+      setLastCalledNumbers((prev) => {
+        const newList = [n, ...prev.slice(0, 4)];
+        return [...new Set(newList)].slice(0, 5);
+      });
+      setCurrentNumber(n);
+      SoundService.playSound(`number_${n}`);
+      return true;
+    } catch (e) {
+      console.error(`[markNumberPositions] error applying ${n}:`, e);
+      return false;
+    }
+  };
 
   useEffect(() => {
     localStorage.setItem("bingoAutoCallSpeed", speed);
@@ -181,11 +410,14 @@ const BingoGame = () => {
   // Keep a Set of called numbers for O(1) membership checks
   useEffect(() => {
     try {
-      calledNumbersSetRef.current = new Set(
-        Array.isArray(calledNumbers) ? calledNumbers : []
-      );
+      const list = Array.isArray(calledNumbers) ? calledNumbers : [];
+      calledNumbersSetRef.current = new Set(list);
+      // Ensure appliedNumbersRef is in sync with authoritative calledNumbers
+      // so we don't re-apply numbers that were already recorded by the server.
+      appliedNumbersRef.current = new Set(list);
     } catch (e) {
       calledNumbersSetRef.current = new Set();
+      appliedNumbersRef.current = new Set();
     }
   }, [calledNumbers]);
 
@@ -761,7 +993,7 @@ const BingoGame = () => {
     updateJackpotWinnerDisplay();
   }, [user?.id]); // Depend on user.id for refetch
 
-  // Auto-call scheduler (drift-corrected and sequential, schedules before work)
+  // Auto-call scheduler (drift-corrected and sequential, schedules after work)
   useEffect(() => {
     const nowMs = () =>
       typeof performance !== "undefined" ? performance.now() : Date.now();
@@ -804,22 +1036,32 @@ const BingoGame = () => {
           return;
         }
 
-        // Schedule the following tick BEFORE doing the work, to keep cadence
-        const intervalMs = speed * 1000;
-        let nextTarget =
-          (autoSchedulerRef.current.nextAt || nowMs()) + intervalMs;
-        const now = nowMs();
-        if (nextTarget < now - intervalMs) {
-          // If we fell way behind (tab throttling, etc), reset schedule
-          nextTarget = now + intervalMs;
-        }
-        if (autoModeRef.current) {
-          scheduleNext(nextTarget);
-        }
-
-        // Now perform the call (non-blocking for the schedule)
+        // Now perform the call
         try {
-          await handleCallNumber(null, { isAuto: true });
+          // If there was an interrupted number captured earlier, prefer to
+          // allow handleCallNumber to detect and apply it rather than
+          // passing it as a "manual" number which causes an additional
+          // server request. This prevents double-calling/marking when the
+          // operator toggles auto-call during an in-flight request.
+          let didWork = false;
+          if (interruptedNumberRef.current) {
+            // Do NOT clear interruptedNumberRef here. Call handleCallNumber
+            // with null so its early-path can apply the interrupted number
+            // locally (or decide to call the server once). That keeps a
+            // single, authoritative application flow.
+            didWork = await handleCallNumber(null, { isAuto: true });
+          } else {
+            didWork = await handleCallNumber(null, { isAuto: true });
+          }
+          // Always schedule the next tick while auto mode remains active.
+          // Some ticks may skip doing work (didWork === false) because of
+          // skipNextCallRef or recent aborts; we still want the cadence to
+          // continue rather than stopping the scheduler after one run.
+          if (autoModeRef.current) {
+            const intervalMs = speed * 1000;
+            const now = nowMs();
+            scheduleNext(now + intervalMs);
+          }
         } catch (e) {
           // Swallow here; handleCallNumber manages its own errors
         }
@@ -838,14 +1080,7 @@ const BingoGame = () => {
     return () => {
       stopScheduler();
     };
-  }, [
-    isAutoCall,
-    speed,
-    isGameOver,
-    isPlaying,
-    gameData?._id,
-    gameData?.status,
-  ]);
+  }, [isAutoCall, speed, isGameOver, isPlaying]);
 
   // Fullscreen handling
   useEffect(() => {
@@ -1365,6 +1600,62 @@ const BingoGame = () => {
 
   const handleCallNumber = async (manualNum = null, options = {}) => {
     const isAuto = options?.isAuto === true;
+    // If recently aborted, skip this call to prevent duplicate server processing
+    if (recentlyAbortedRef.current && !manualNum) {
+      console.log("[handleCallNumber] Skipping call due to recent abort");
+      return false;
+    }
+    // If an interrupted number exists (from a previously-aborted call),
+    // prefer sending THAT number to the server next instead of applying it locally.
+    // This keeps client and server in sync so backend winner checks are correct.
+    if (!manualNum && interruptedNumberRef.current) {
+      try {
+        const intNum = interruptedNumberRef.current;
+        console.log(
+          `[handleCallNumber] Early-path: detected interrupted number ${intNum} (will request server to call it). inFlightNumber=${inFlightNumberRef.current}`
+        );
+        // Clear the interrupted marker so we don't loop here again
+        interruptedNumberRef.current = null;
+        // We intend to call the server with this number; remove it from preserved/pendings
+        try {
+          interruptedNumbersSetRef.current.delete(intNum);
+        } catch (e) {}
+        pendingServerCallsRef.current = (
+          pendingServerCallsRef.current || []
+        ).filter((n) => n !== intNum);
+        // Re-enter handleCallNumber as a manual request so normal networking path runs
+        return await handleCallNumber(intNum, options);
+      } catch (e) {
+        console.error("Error scheduling interrupted number with server:", e);
+      }
+    }
+    // If there is a pending server-side call (from a previously-aborted/late response),
+    // apply it now and do not start a new network call. This ensures we only apply
+    // one called number per logical tick and that aborted calls take precedence.
+    if (!manualNum && pendingServerCallsRef.current.length > 0) {
+      const pendingNumber = pendingServerCallsRef.current.shift();
+      if (pendingNumber) {
+        console.log(
+          `[handleCallNumber] Applying pending server-called number ${pendingNumber}. pendingServerCalls now size=${pendingServerCallsRef.current.length}`
+        );
+        applyCalledNumber(pendingNumber);
+      }
+      // Also ensure we don't launch another call this same tick
+      skipNextCallRef.current = true;
+      return true; // Applied a number
+    }
+
+    // If flagged to skip this call (a late response will be applied), defer
+    // this invocation so the sequenced call happens in the next scheduler tick.
+    if (skipNextCallRef.current && !manualNum) {
+      skipNextCallRef.current = false;
+      console.log(
+        "[handleCallNumber] Skipping call because a pending server call is being applied"
+      );
+      return false; // Did not perform work
+    }
+    // Mark this call attempt with a sequence number so late responses can be ignored.
+    const myCallSeq = ++callSequenceRef.current;
     // Guard conditions; avoid turning off auto-call if we're simply busy
     if (
       isGameOver ||
@@ -1376,7 +1667,7 @@ const BingoGame = () => {
         setIsGameFinishedModalOpen(true);
         setIsAutoCall(false);
         await handleFinish();
-        return;
+        return false;
       }
       if (!isAuto) {
         setCallError(
@@ -1386,25 +1677,25 @@ const BingoGame = () => {
         );
         setIsErrorModalOpen(true);
       }
-      return;
+      return false;
     }
     // Prevent overlapping network calls at a higher level (covers race windows)
     if (isCallingNumber || inFlightCallRef.current) {
       // If auto mode, queue one pending auto-call to be flushed after current call ends
       if (isAuto) {
         autoSchedulerRef.current.pending = true;
-        return;
+        return false;
       }
       setCallError("Cannot call number: A call is already in progress");
       setIsErrorModalOpen(true);
-      return;
+      return false;
     }
     // Server-authoritative path only (no optimistic UI) to avoid mismatches
     if (!gameData?._id) {
       setCallError("Game ID is missing");
       setIsErrorModalOpen(true);
       setIsAutoCall(false);
-      return;
+      return false;
     }
     setIsCallingNumber(true);
     setCallError(null);
@@ -1427,7 +1718,7 @@ const BingoGame = () => {
       console.log(
         `[handleCallNumber] After updatePrizePoolDisplay, gameData.prizePool: ${gameData?.prizePool}`
       );
-      if (manualNum !== null && manualNum !== undefined && manualNum !== "") {
+  if (manualNum !== null && manualNum !== undefined && manualNum !== "") {
         const num = parseInt(manualNum, 10);
         if (isNaN(num) || num < 1 || num > 75) {
           throw new Error(`Invalid manual number: ${manualNum} (must be 1-75)`);
@@ -1461,6 +1752,13 @@ const BingoGame = () => {
             ];
       }
       console.log(`[handleCallNumber] Calling number: ${numberToCall}`);
+      try {
+        bgLog("handleCallNumber calling", {
+          numberToCall,
+          isAuto,
+          seq: myCallSeq,
+        });
+      } catch (e) {}
       // Mark in-flight and create AbortController to allow cancellation
       inFlightCallRef.current = true;
       inFlightNumberRef.current = numberToCall;
@@ -1479,7 +1777,43 @@ const BingoGame = () => {
         number: numberToCall,
         signal: controller.signal,
       });
+      // If another call started after this one, treat this as a late/aborted
+      // response. Enqueue the server-called number so it is applied before any
+      // newly-sequenced local call (avoids double-call in the same tick).
+      if (myCallSeq !== callSequenceRef.current) {
+        const lateCalledNumber =
+          response?.calledNumber ||
+          numberToCall ||
+          response?.game?.calledNumbers?.[
+            response?.game?.calledNumbers?.length - 1
+          ];
+        if (
+          lateCalledNumber &&
+          !calledNumbersSetRef.current.has(lateCalledNumber) &&
+          !pendingServerCallsRef.current.includes(lateCalledNumber) &&
+          !ignoreLateResponsesRef.current &&
+          // Do not enqueue late responses for numbers we intentionally
+          // preserved after an abort; they will be applied from
+          // interruptedNumberRef when appropriate.
+          !interruptedNumbersSetRef.current.has(lateCalledNumber)
+        ) {
+          console.warn(
+            `[handleCallNumber] Enqueuing late response number ${lateCalledNumber} for sequence ${myCallSeq} (current ${callSequenceRef.current})`
+          );
+          pendingServerCallsRef.current.push(lateCalledNumber);
+          // Ensure the next local call is deferred so this late response is applied first
+          skipNextCallRef.current = true;
+        } else {
+          console.warn(
+            `[handleCallNumber] Ignoring late response for sequence ${myCallSeq} (current ${callSequenceRef.current}) - number already applied, absent, or late responses ignored`
+          );
+        }
+        return;
+      }
       console.log(`[handleCallNumber] Response from callNumber:`, response);
+      try {
+        bgLog("handleCallNumber response", response);
+      } catch (e) {}
       if (isAuto) {
         const t1 =
           typeof performance !== "undefined" ? performance.now() : Date.now();
@@ -1506,18 +1840,12 @@ const BingoGame = () => {
       if (!calledNumber) {
         throw new Error("No called number in response");
       }
-      console.log(`[handleCallNumber] Called number: ${calledNumber}`);
-      setCalledNumbers((prev) => {
-        if (!prev.includes(calledNumber)) {
-          return [...prev, calledNumber];
-        }
-        return prev;
-      });
-      setLastCalledNumbers((prev) => {
-        const newList = [calledNumber, ...prev.slice(0, 4)];
-        return [...new Set(newList)].slice(0, 5);
-      });
-      setCurrentNumber(calledNumber);
+      console.log(`[handleCallNumber] Called number (server): ${calledNumber}`);
+      // Apply exactly one number per call: trust the server-authoritative number.
+      // If a manual number was requested but the server returned a different
+      // number, we do NOT apply the requested number locally to avoid double
+      // counting across ticks. Always apply the server's number only.
+      applyCalledNumber(Number(calledNumber));
       // Preserve the current prizePool to avoid flashing 0 during re-render
       const currentPrizePool = gameData?.prizePool || 0;
       console.log(
@@ -1563,23 +1891,7 @@ const BingoGame = () => {
       console.log(
         `[handleCallNumber] After await updatePrizePoolDisplay, gameData.prizePool: ${gameData?.prizePool}`
       );
-      setBingoCards((prevCards) =>
-        prevCards.map((card) => {
-          const newCard = { ...card };
-          const letters = ["B", "I", "N", "G", "O"];
-          for (let col = 0; col < 5; col++) {
-            for (let row = 0; row < 5; row++) {
-              const letter = letters[col];
-              const number = card.numbers[letter][row];
-              if (typeof number === "number" && number === calledNumber) {
-                newCard.markedPositions[letter][row] = true;
-              }
-            }
-          }
-          return newCard;
-        })
-      );
-      SoundService.playSound(`number_${calledNumber}`);
+      // applyCalledNumber already handled marking and sound
       if (manualNum) {
         setManualNumber("");
       }
@@ -1598,7 +1910,34 @@ const BingoGame = () => {
       if (isAborted) {
         // Request was cancelled (likely because auto-call was turned off). Clean up and return silently.
         console.log("[handleCallNumber] Call aborted by controller");
+        try {
+          bgLog("handleCallNumber aborted", {
+            inFlightNumber: inFlightNumberRef.current,
+          });
+        } catch (e) {}
         setCallError(null);
+        // Preserve the interrupted/in-flight number so the next "Next" click
+        // (or the next auto tick) can prefer to call/apply it instead of
+        // jumping to a new random number.
+        // Previously we stored the in-flight number as "interrupted" so the
+        // UI could re-apply it later. To prefer UX where a canceled number
+        // is applied first on the next tick, store the interrupted number
+        // and track it in a set so late server responses for this number
+        // are not enqueued (avoids duplicates).
+        try {
+          if (inFlightNumberRef.current) {
+            const num = inFlightNumberRef.current;
+            interruptedNumberRef.current = num;
+            try {
+              interruptedNumbersSetRef.current.add(num);
+            } catch (ee) {}
+            console.log(
+              `[handleCallNumber] Call aborted; storing interrupted number ${num} for next tick.`
+            );
+          }
+        } catch (e) {
+          console.warn("Failed to store interrupted number after abort:", e);
+        }
         // ensure we don't keep the in-flight number excluded from next picks
         inFlightCallRef.current = false;
         inFlightNumberRef.current = null;
@@ -1649,6 +1988,10 @@ const BingoGame = () => {
       // Clear in-flight markers
       inFlightCallRef.current = false;
       inFlightNumberRef.current = null;
+      // Invalidate this sequence so any late responses from this call are ignored
+      try {
+        callSequenceRef.current = (callSequenceRef.current || 0) + 1;
+      } catch (e) {}
       // If an auto tick arrived while busy, fire a pending call immediately
       if (
         autoSchedulerRef.current.pending &&
@@ -1667,6 +2010,40 @@ const BingoGame = () => {
   };
 
   const handleNextClick = async () => {
+    // Reset recently aborted flag for manual calls
+    recentlyAbortedRef.current = false;
+    try {
+      bgLog("handleNextClick invoked", {
+        interruptedNumber: interruptedNumberRef.current,
+      });
+    } catch (e) {}
+    // If we have a previously-interrupted number, prefer calling/applying it
+    // when the user presses Next.
+    if (interruptedNumberRef.current) {
+      if (
+        !isPlaying ||
+        isGameOver ||
+        !gameData?._id ||
+        isCallingNumber ||
+        gameData?.status !== "active"
+      ) {
+        setCallError(
+          gameData?.status !== "active"
+            ? "Game is paused or finished"
+            : "Cannot call number: Game is over, paused, or already calling"
+        );
+        setIsErrorModalOpen(true);
+        return;
+      }
+      const toCall = interruptedNumberRef.current;
+      interruptedNumberRef.current = null;
+      try {
+        interruptedNumbersSetRef.current.delete(toCall);
+      } catch (e) {}
+      await handleCallNumber(toCall);
+      return;
+    }
+
     if (
       !isPlaying ||
       isGameOver ||
@@ -1682,13 +2059,37 @@ const BingoGame = () => {
       setIsErrorModalOpen(true);
       return;
     }
+
     await handleCallNumber();
   };
 
   const handleToggleAutoCall = () => {
     const turningOn = !isAutoCall;
+    try {
+      bgLog("handleToggleAutoCall", { turningOn });
+    } catch (e) {}
     // If turning off, abort any in-flight call
     if (!turningOn) {
+      // If there's an in-flight number, preserve it BEFORE aborting so we
+      // can guarantee it will be applied first on the next tick/Next press.
+      try {
+        const preserved = inFlightNumberRef.current;
+        if (preserved) {
+          interruptedNumberRef.current = preserved;
+          try {
+            interruptedNumbersSetRef.current.add(preserved);
+          } catch (ee) {}
+          try {
+            bgLog(
+              "handleToggleAutoCall preserving interrupted number",
+              preserved
+            );
+          } catch (ee) {}
+        }
+      } catch (e) {
+        console.warn("Failed to preserve in-flight number on toggle off:", e);
+      }
+
       if (callAbortControllerRef.current) {
         try {
           callAbortControllerRef.current.abort();
@@ -1702,6 +2103,25 @@ const BingoGame = () => {
       inFlightNumberRef.current = null;
       autoSchedulerRef.current.pending = false;
       setIsCallingNumber(false);
+      // Invalidate any previous call so late responses are ignored
+      try {
+        callSequenceRef.current = (callSequenceRef.current || 0) + 1;
+      } catch (e) {}
+      // Set ignore flag to prevent enqueuing late responses from aborted calls
+      ignoreLateResponsesRef.current = true;
+      // Set recently aborted flag to prevent immediate new calls
+      recentlyAbortedRef.current = true;
+      // Also postpone/skip the immediate next call attempt from scheduler
+      // so we don't start a fresh call right after aborting.
+      skipNextCallRef.current = true;
+      // Clear the recently-aborted flag after a short delay
+      setTimeout(() => {
+        recentlyAbortedRef.current = false;
+      }, 1000);
+    } else {
+      // Reset ignore flag when turning auto-call back on
+      ignoreLateResponsesRef.current = false;
+      recentlyAbortedRef.current = false;
     }
     setIsAutoCall(turningOn);
   };
@@ -1828,6 +2248,10 @@ const BingoGame = () => {
       setCalledNumbers([]);
       setLastCalledNumbers([]);
       setCurrentNumber(null);
+      // Clear applied numbers tracking when shuffling/resetting
+      try {
+        appliedNumbersRef.current = new Set();
+      } catch (e) {}
       setBingoCards((prev) =>
         prev.map((card) => ({
           ...card,
@@ -2305,8 +2729,9 @@ const BingoGame = () => {
           }))
         );
         // Trigger celebration (e.g., confetti)
+        // NOTE: play sound from the modal component to avoid duplicate or
+        // incorrect plays when multiple code paths open/close modals rapidly.
         createConfetti();
-        SoundService.playSound("winner");
       } else {
         // Non-bingo/late call handling
         // Ensure any optimistic winner modal is closed
@@ -2401,7 +2826,7 @@ const BingoGame = () => {
               );
             }, 1000);
             if (isLateCall) {
-              SoundService.playSound("you_didnt_win"); // Optional sound
+              // Non-winner sound will be played by the modal component when it opens.
             }
           }
 
@@ -2452,103 +2877,18 @@ const BingoGame = () => {
 
   // NEW: Define updateMarkedGrids (was missing)
   const updateMarkedGrids = () => {
-    // Fast path: use precomputed index of number -> card positions
-    const index = numberIndexRef.current;
-    if (!index || index.size === 0) {
-      // Fallback to previous behavior if index is not built
-      setBingoCards((prevCards) =>
-        prevCards.map((card) => {
-          const newCard = { ...card };
-          const letters = ["B", "I", "N", "G", "O"];
-          calledNumbers.forEach((calledNum) => {
-            for (let col = 0; col < 5; col++) {
-              for (let row = 0; row < 5; row++) {
-                const letter = letters[col];
-                const number = card.numbers[letter][row];
-                if (typeof number === "number" && number === calledNum) {
-                  newCard.markedPositions[letter][row] = true;
-                }
-              }
-            }
-          });
-          return newCard;
-        })
+    // Only process newly-called numbers to avoid re-applying numbers and
+    // to centralize marking through markNumberPositions.
+    try {
+      const newly = (calledNumbers || []).filter(
+        (n) => !appliedNumbersRef.current.has(n)
       );
-      setCards((prevCards) => prevCards.map((c) => ({ ...c })));
-      return;
-    }
-
-    // Only update cards that have newly called numbers
-    const affectedCardUpdates = new Map(); // cardId -> updatedCard
-    for (const calledNum of calledNumbers) {
-      const entries = index.get(calledNum);
-      if (!entries) continue;
-      for (const pos of entries) {
-        const id = pos.cardId;
-        if (!affectedCardUpdates.has(id)) {
-          // clone from current state (search in bingoCards)
-          const base =
-            bingoCards.find((c) => c.id === id) ||
-            cards.find((c) => c.id === id) ||
-            null;
-          if (!base) continue;
-          affectedCardUpdates.set(id, {
-            ...base,
-            markedPositions: {
-              B: base.markedPositions?.B?.slice() || [
-                false,
-                false,
-                false,
-                false,
-                false,
-              ],
-              I: base.markedPositions?.I?.slice() || [
-                false,
-                false,
-                false,
-                false,
-                false,
-              ],
-              N: base.markedPositions?.N?.slice() || [
-                false,
-                false,
-                true,
-                false,
-                false,
-              ],
-              G: base.markedPositions?.G?.slice() || [
-                false,
-                false,
-                false,
-                false,
-                false,
-              ],
-              O: base.markedPositions?.O?.slice() || [
-                false,
-                false,
-                false,
-                false,
-                false,
-              ],
-            },
-          });
-        }
-        const upd = affectedCardUpdates.get(id);
-        upd.markedPositions[pos.letter][pos.row] = true;
+      if (!newly.length) return;
+      for (const n of newly) {
+        markNumberPositions(n);
       }
-    }
-
-    if (affectedCardUpdates.size > 0) {
-      setBingoCards((prev) =>
-        prev.map((c) =>
-          affectedCardUpdates.has(c.id) ? affectedCardUpdates.get(c.id) : c
-        )
-      );
-      setCards((prev) =>
-        prev.map((c) =>
-          affectedCardUpdates.has(c.id) ? affectedCardUpdates.get(c.id) : c
-        )
-      );
+    } catch (e) {
+      console.error("[updateMarkedGrids] error:", e);
     }
   };
 
@@ -2701,6 +3041,13 @@ const BingoGame = () => {
           </span>
         </button>
       </div>
+      {/* Offline banner */}
+      {!isOnline && (
+        <div className="w-full max-w-[1200px] mt-2 p-3 bg-red-600 text-white rounded">
+          You are offline — network requests are paused. Reconnect to resume
+          game actions.
+        </div>
+      )}
       {/* Title and Recent Numbers */}
       <div className="w-full flex justify-between px-16 items-center my-8 max-[1100px]:flex-col max-[1100px]:gap-2">
         <h1 className="text-7xl font-black text-[#f0e14a] text-center">
@@ -2747,7 +3094,7 @@ const BingoGame = () => {
                   : "bg-[#e9744c] hover:bg-[#f0b76a]"
               } text-black border-none px-4 py-2 font-bold rounded cursor-pointer text-sm transition-colors duration-300`}
               onClick={handleToggleAutoCall}
-              disabled={!gameData?._id || !isPlaying || isGameOver}
+              disabled={!gameData?._id || !isPlaying || isGameOver || !isOnline}
             >
               Auto Call {isAutoCall ? "On" : "Off"}
             </button>
@@ -2755,7 +3102,11 @@ const BingoGame = () => {
               className="bg-[#e9a64c] text-black border-none px-4 py-2 font-bold rounded cursor-pointer text-sm transition-colors duration-300 hover:bg-[#f0b76a]"
               onClick={handleNextClick}
               disabled={
-                !gameData?._id || isCallingNumber || !isPlaying || isGameOver
+                !gameData?._id ||
+                isCallingNumber ||
+                !isPlaying ||
+                isGameOver ||
+                !isOnline
               }
             >
               {isCallingNumber ? "Calling..." : "Next"}
@@ -2763,7 +3114,7 @@ const BingoGame = () => {
             <button
               className="bg-[#e9a64c] text-black border-none px-4 py-2 font-bold rounded cursor-pointer text-sm transition-colors duration-300 hover:bg-[#f0b76a]"
               onClick={handleFinish}
-              disabled={isGameOver}
+              disabled={isGameOver || !isOnline}
             >
               Finish
             </button>
@@ -2798,7 +3149,7 @@ const BingoGame = () => {
             <button
               className="bg-[#e9a64c] text-black border-none px-4 py-4 font-bold rounded cursor-pointer text-sm transition-colors duration-300 hover:bg-[#f0b76a]"
               onClick={() => handleCheckCard(cardId, undefined)} // FIXED: Pass preferredPattern as undefined
-              disabled={!gameData?._id}
+              disabled={!gameData?._id || !isOnline}
             >
               Check
             </button>

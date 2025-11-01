@@ -29,16 +29,29 @@ const BingoModals = ({
   cards = [],
 }) => {
   useEffect(() => {
-    if (isWinnerModalOpen) {
-      SoundService.playSound("winner");
+    // Only play winner sound when modal is opened for a confirmed winning card.
+    // Guard against late-call / disqualified scenarios and ensure we have
+    // winning numbers or a winner card grid before playing.
+    if (isWinnerModalOpen && bingoStatus) {
+      const hasWinningNumbers =
+        Array.isArray(bingoStatus.winningNumbers) &&
+        bingoStatus.winningNumbers.length > 0;
+      const hasWinnerGrid =
+        Array.isArray(bingoStatus.winnerCardNumbers) &&
+        Array.isArray(bingoStatus.winnerCardNumbers[0]);
+      const isDisqualified = !!bingoStatus.lateCall || !!bingoStatus.disqualified;
+      if (!isDisqualified && (hasWinningNumbers || hasWinnerGrid)) {
+        SoundService.playSound("winner");
+      }
     }
-  }, [isWinnerModalOpen]);
+  }, [isWinnerModalOpen, bingoStatus]);
 
   useEffect(() => {
-    if (isNonWinnerModalOpen) {
+    // Play non-winner sound only when we have card details to show.
+    if (isNonWinnerModalOpen && nonWinnerCardData) {
       SoundService.playSound("you_didnt_win");
     }
-  }, [isNonWinnerModalOpen]);
+  }, [isNonWinnerModalOpen, nonWinnerCardData]);
 
   useEffect(() => {
     if (isGameFinishedModalOpen) {
