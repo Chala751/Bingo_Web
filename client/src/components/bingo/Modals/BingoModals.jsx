@@ -39,16 +39,22 @@ const BingoModals = ({
       const hasWinnerGrid =
         Array.isArray(bingoStatus.winnerCardNumbers) &&
         Array.isArray(bingoStatus.winnerCardNumbers[0]);
-      const isDisqualified = !!bingoStatus.lateCall || !!bingoStatus.disqualified;
+      const isDisqualified =
+        !!bingoStatus.lateCall || !!bingoStatus.disqualified;
       if (!isDisqualified && (hasWinningNumbers || hasWinnerGrid)) {
         SoundService.playSound("winner");
+        // Ensure any non-winner indicators are closed to avoid contradictory cues
+        try {
+          setIsNonWinnerModalOpen(false);
+          setNonWinnerCardData(null);
+        } catch {}
       }
     }
   }, [isWinnerModalOpen, bingoStatus]);
 
   useEffect(() => {
-    // Play non-winner sound only when we have card details to show.
-    if (isNonWinnerModalOpen && nonWinnerCardData) {
+    // Play non-winner sound only when we have card details to show and no winner modal is open.
+    if (isNonWinnerModalOpen && nonWinnerCardData && !isWinnerModalOpen) {
       SoundService.playSound("you_didnt_win");
     }
   }, [isNonWinnerModalOpen, nonWinnerCardData]);
@@ -173,6 +179,16 @@ const BingoModals = ({
     return grid;
   };
 
+  // Robust integer parser: handles numbers, numeric strings, and trims extras
+  const toInt = (v) => {
+    if (typeof v === "number" && Number.isFinite(v)) return v;
+    if (typeof v === "string") {
+      const m = v.match(/\d+/);
+      return m ? parseInt(m[0], 10) : NaN;
+    }
+    return NaN;
+  };
+
   return (
     <>
       {isWinnerModalOpen && (
@@ -203,7 +219,7 @@ const BingoModals = ({
                 className="text-[#f0e14a] text-lg font-extrabold flex items-center gap-2"
               >
                 <span className="text-2xl">🎉</span>
-                <span>Winner</span>
+                <span>Winner Found</span>
               </h2>
               <button
                 aria-label="Close winner dialog"
@@ -314,31 +330,123 @@ const BingoModals = ({
                           .fill()
                           .map(() => Array(5).fill("FREE"));
                       }
-                      const winningIndices = bingoStatus.winningIndices || [];
+                      // Normalize and prioritize pattern data
+                      const winningIndicesArr =
+                        bingoStatus.winningIndices || [];
+                      // Note: we compute an effective set below; the original presence flag isn't needed
+                      const winIndexSet = new Set(
+                        (winningIndicesArr || []).map((x) => toInt(x))
+                      );
+
                       // Prefer backend numbers but fall back to local computed ones
-                      const winningNumbers =
+                      const winningNumbersArr =
                         bingoStatus.winningNumbers ||
                         bingoStatus.patternInfo?.localSelectedNumbers ||
                         [];
-                      const otherCalledNumbers =
-                        bingoStatus.otherCalledNumbers || [];
+                      const winNumberSet = new Set(
+                        (winningNumbersArr || []).map((x) => toInt(x))
+                      );
+
+                      const completingNumber =
+                        bingoStatus?.completingNumber ?? null;
+                      const calledSet = new Set(
+                        (calledNumbers || []).map((x) => toInt(x))
+                      );
+                      const otherCalledSet = new Set(
+                        (bingoStatus.otherCalledNumbers || []).map((x) =>
+                          toInt(x)
+                        )
+                      );
+
+                      // Local fallback: if backend didn't supply winners, compute from grid + called
+                      const isMarked = (cell) =>
+                        cell === "FREE" || calledSet.has(toInt(cell));
+
+                      const computeFallbackWin = () => {
+                        // rows
+                        for (let r = 0; r < 5; r++) {
+                          const ok = [0, 1, 2, 3, 4].every((c) =>
+                            isMarked(cardGrid[r][c])
+                          );
+                          if (ok)
+                            return {
+                              indices: [0, 1, 2, 3, 4].map((c) => r * 5 + c),
+                            };
+                        }
+                        // cols
+                        for (let c = 0; c < 5; c++) {
+                          const ok = [0, 1, 2, 3, 4].every((r) =>
+                            isMarked(cardGrid[r][c])
+                          );
+                          if (ok)
+                            return {
+                              indices: [0, 1, 2, 3, 4].map((r) => r * 5 + c),
+                            };
+                        }
+                        // main diag
+                        if (
+                          [0, 1, 2, 3, 4].every((i) => isMarked(cardGrid[i][i]))
+                        ) {
+                          return { indices: [0, 6, 12, 18, 24] };
+                        }
+                        // other diag
+                        if (
+                          [0, 1, 2, 3, 4].every((i) =>
+                            isMarked(cardGrid[i][4 - i])
+                          )
+                        ) {
+                          return { indices: [4, 8, 12, 16, 20] };
+                        }
+                        // four corners (center optional)
+                        const corners = [
+                          [0, 0],
+                          [0, 4],
+                          [4, 0],
+                          [4, 4],
+                        ];
+                        if (
+                          corners.every(([r, c]) => isMarked(cardGrid[r][c]))
+                        ) {
+                          return { indices: [0, 4, 20, 24] };
+                        }
+                        return { indices: [] };
+                      };
+
+                      let effectiveWinIndexSet = new Set(winIndexSet);
+                      let effectiveWinNumberSet = new Set(winNumberSet);
+                      if (
+                        effectiveWinIndexSet.size === 0 &&
+                        effectiveWinNumberSet.size === 0
+                      ) {
+                        const fb = computeFallbackWin();
+                        if (fb.indices && fb.indices.length) {
+                          effectiveWinIndexSet = new Set(fb.indices);
+                        }
+                      }
+                      // (unused; replaced by otherCalledSet)
                       return cardGrid.map((row, rowIndex) =>
                         (row || Array(5).fill("FREE")).map(
                           (number, colIndex) => {
                             const cellIndex = rowIndex * 5 + colIndex;
                             const isFreeSpace = number === "FREE";
                             const isWinningCell =
-                              winningIndices.includes(cellIndex);
-                            const numberValue = Number(number);
+                              effectiveWinIndexSet.size > 0
+                                ? effectiveWinIndexSet.has(cellIndex)
+                                : false;
+                            const numberValue = toInt(number);
                             const isWinningNumber =
-                              winningNumbers.includes(numberValue);
+                              effectiveWinIndexSet.size === 0
+                                ? effectiveWinNumberSet.has(numberValue)
+                                : false;
                             const isOtherCalledNumber =
-                              otherCalledNumbers.includes(numberValue) &&
-                              !isWinningNumber;
+                              otherCalledSet.has(numberValue) &&
+                              !isWinningNumber &&
+                              !isWinningCell;
                             const isCalledNumber =
-                              calledNumbers.includes(numberValue) ||
-                              isOtherCalledNumber ||
-                              isWinningNumber;
+                              (calledSet.has(numberValue) ||
+                                isOtherCalledNumber) &&
+                              !isWinningCell &&
+                              !isWinningNumber;
                             const displayNumber = isFreeSpace
                               ? "FREE"
                               : numberValue;
@@ -348,13 +456,20 @@ const BingoModals = ({
                             let sizeClass = "w-14 h-14 text-lg";
                             let bgClass = "bg-white text-black border-gray-300";
                             let extra = "";
+                            const isCompletingCell =
+                              !isFreeSpace &&
+                              numberValue === completingNumber &&
+                              (isWinningCell || isWinningNumber);
+
                             if (isFreeSpace) {
                               bgClass =
                                 "bg-blue-700 text-white border-blue-500";
                             } else if (isWinningCell || isWinningNumber) {
                               bgClass =
                                 "bg-gradient-to-br from-orange-500 to-orange-600 text-white border-orange-700 shadow-[0_6px_24px_rgba(255,165,0,0.35)]";
-                              extra = "ring-4 ring-orange-300/30";
+                              extra = isCompletingCell
+                                ? "ring-4 ring-amber-300/60"
+                                : "ring-4 ring-orange-300/30";
                             } else if (isCalledNumber) {
                               bgClass =
                                 "bg-blue-600 text-white border-blue-400 shadow-[0_4px_12px_rgba(59,130,246,0.16)]";
@@ -381,8 +496,14 @@ const BingoModals = ({
                     })()}
                   </div>
                 </div>
-                {/* Legend (pattern-only removed) */}
+                {/* Legend */}
                 <div className="flex gap-2 mt-2 justify-center items-center">
+                  {bingoStatus?.completingNumber != null && (
+                    <div className="flex items-center gap-1">
+                      <span className="w-4 h-4 bg-amber-400 rounded" />
+                      <span className="text-xs text-white">Completing</span>
+                    </div>
+                  )}
                   <div className="flex items-center gap-1">
                     <span className="w-4 h-4 bg-orange-500 rounded" />
                     <span className="text-xs text-white">Winning</span>
