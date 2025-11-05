@@ -23,7 +23,11 @@ await connectDB();
 // Middleware
 app.use(
   cors({
-    origin: "https://jokerbingo.xyz",
+    origin: [
+      "https://jokerbingo.xyz",
+      "http://localhost:5173",
+      "http://localhost:3000",
+    ],
     credentials: true,
   })
 );
@@ -108,7 +112,9 @@ app.get("/resources", async (req, res) => {
       bandwidthUsage: bandwidth,
     });
   } catch (err) {
-    res.status(500).json({ error: "Failed to get resources", details: err.message });
+    res
+      .status(500)
+      .json({ error: "Failed to get resources", details: err.message });
   }
 });
 

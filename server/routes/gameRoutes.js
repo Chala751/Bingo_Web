@@ -37,6 +37,8 @@ import {
   getCard,
   pauseGame,
   updateGameStatus,
+  setAutoCallEnabled,
+  restartGame,
 } from "../controllers/bingoController.js";
 import FutureWinner from "../models/FutureWinner.js";
 import Card from "../models/Card.js"; // Added for reconfigureFutureWinner
@@ -353,6 +355,8 @@ router.post("/:id/select-winner", verifyToken, validate, selectWinner);
 router.post("/:id/finish", verifyToken, validate, finishGame);
 router.post("/:id/start", verifyToken, startGame);
 router.post("/:id/pause", verifyToken, pauseGame);
+router.patch("/:id/auto-call", verifyToken, validate, setAutoCallEnabled);
+router.post("/:id/restart", verifyToken, validate, restartGame);
 router.patch("/:id", verifyToken, validate, updateGame);
 
 // Future winners routes

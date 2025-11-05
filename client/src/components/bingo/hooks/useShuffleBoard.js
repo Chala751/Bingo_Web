@@ -2,7 +2,11 @@
 import { useState, useRef } from "react";
 import SoundService from "../../../services/sound";
 
-export default function useShuffleBoard({ setCalledNumbers, setBingoCards, setCards }) {
+export default function useShuffleBoard({
+  setCalledNumbers,
+  setBingoCards,
+  setCards,
+}) {
   const boardNumbers = Array.from({ length: 75 }, (_, i) => i + 1);
   const [displayNumbers, setDisplayNumbers] = useState(boardNumbers);
   const [isShuffling, setIsShuffling] = useState(false);
@@ -26,41 +30,51 @@ export default function useShuffleBoard({ setCalledNumbers, setBingoCards, setCa
       clearInterval(shuffleIntervalRef.current);
       SoundService.playSound("shuffle", { stop: true });
       setDisplayNumbers(boardNumbers);
-      setCalledNumbers([]);
-      setBingoCards(prev => prev.map(c => ({
-        ...c,
-        markedPositions: {
-          B: [false, false, false, false, false],
-          I: [false, false, false, false, false],
-          N: [false, true, false, false, false],
-          G: [false, false, false, false, false],
-          O: [false, false, false, false, false],
-        },
-        winningPositions: {
-          B: [false, false, false, false, false],
-          I: [false, false, false, false, false],
-          N: [false, false, false, false, false],
-          G: [false, false, false, false, false],
-          O: [false, false, false, false, false],
-        },
-      })));
-      setCards(prev => prev.map(c => ({
-        ...c,
-        markedPositions: {
-          B: [false, false, false, false, false],
-          I: [false, false, false, false, false],
-          N: [false, true, false, false, false],
-          G: [false, false, false, false, false],
-          O: [false, false, false, false, false],
-        },
-        winningPositions: {
-          B: [false, false, false, false, false],
-          I: [false, false, false, false, false],
-          N: [false, false, false, false, false],
-          G: [false, false, false, false, false],
-          O: [false, false, false, false, false],
-        },
-      })));
+      if (typeof setCalledNumbers === "function") {
+        setCalledNumbers([]);
+      }
+      if (typeof setBingoCards === "function") {
+        setBingoCards((prev) =>
+          prev.map((c) => ({
+            ...c,
+            markedPositions: {
+              B: [false, false, false, false, false],
+              I: [false, false, false, false, false],
+              N: [false, true, false, false, false],
+              G: [false, false, false, false, false],
+              O: [false, false, false, false, false],
+            },
+            winningPositions: {
+              B: [false, false, false, false, false],
+              I: [false, false, false, false, false],
+              N: [false, false, false, false, false],
+              G: [false, false, false, false, false],
+              O: [false, false, false, false, false],
+            },
+          }))
+        );
+      }
+      if (typeof setCards === "function") {
+        setCards((prev) =>
+          prev.map((c) => ({
+            ...c,
+            markedPositions: {
+              B: [false, false, false, false, false],
+              I: [false, false, false, false, false],
+              N: [false, true, false, false, false],
+              G: [false, false, false, false, false],
+              O: [false, false, false, false, false],
+            },
+            winningPositions: {
+              B: [false, false, false, false, false],
+              I: [false, false, false, false, false],
+              N: [false, false, false, false, false],
+              G: [false, false, false, false, false],
+              O: [false, false, false, false, false],
+            },
+          }))
+        );
+      }
       setIsShuffling(false);
     }, 5000);
   };

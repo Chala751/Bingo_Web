@@ -47,7 +47,9 @@ const BingoModals = ({
         try {
           setIsNonWinnerModalOpen(false);
           setNonWinnerCardData(null);
-        } catch {}
+        } catch {
+          /* noop */
+        }
       }
     }
   }, [isWinnerModalOpen, bingoStatus]);

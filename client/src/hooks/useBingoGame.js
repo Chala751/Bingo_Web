@@ -1,4 +1,4 @@
-import { useState, useCallback } from "react";
+import { useState, useCallback, useRef, useEffect } from "react";
 import gameService from "../services/game";
 
 export const useBingoGame = () => {
@@ -6,20 +6,79 @@ export const useBingoGame = () => {
   const [error, setError] = useState(null);
   const [bingoStatus, setBingoStatus] = useState(null);
 
+  // Track latest request sequence per action to avoid out-of-order state writes
+  const seqRef = useRef({
+    fetchGame: 0,
+    callNumber: 0,
+    checkBingo: 0,
+    selectWinner: 0,
+    finishGame: 0,
+  });
+
+  // Keep AbortControllers per action; abort previous when a new request starts
+  const controllersRef = useRef({
+    fetchGame: null,
+    callNumber: null,
+    checkBingo: null,
+    selectWinner: null,
+    finishGame: null,
+  });
+
+  const startAction = (key) => {
+    // increment sequence and create/replace controller
+    seqRef.current[key] += 1;
+    if (controllersRef.current[key]) {
+      try {
+        controllersRef.current[key].abort();
+      } catch {
+        // ignore
+      }
+    }
+    const controller = new AbortController();
+    controllersRef.current[key] = controller;
+    return { seq: seqRef.current[key], signal: controller.signal };
+  };
+
+  // On unmount, abort all in-flight requests to avoid late state updates
+  useEffect(() => {
+    const currentControllers = controllersRef.current;
+    return () => {
+      Object.values(currentControllers).forEach((c) => {
+        try {
+          c && c.abort();
+        } catch {
+          // ignore
+        }
+      });
+    };
+  }, []);
+
   const fetchGame = useCallback(async (id) => {
     if (!id) {
       setError("Invalid game ID");
       throw new Error("Invalid game ID");
     }
     try {
-      const response = await gameService.getGame(id);
+      const { seq, signal } = startAction("fetchGame");
+      const response = await gameService.getGame(id, { signal });
       if (!response) {
         throw new Error("No game data returned");
       }
-      setGame(response);
-      setError(null);
+      // Only update state if this is the latest request for this action
+      if (seq === seqRef.current.fetchGame) {
+        setGame(response);
+        setError(null);
+      }
       return response;
     } catch (error) {
+      const isCanceled =
+        error?.code === "ERR_CANCELED" ||
+        error?.name === "CanceledError" ||
+        /aborted|canceled/i.test(error?.message || "");
+      if (isCanceled) {
+        // Swallow cancellation to avoid noisy errors during rapid updates
+        throw error;
+      }
       const errorMessage =
         error.response?.data?.error || error.message || "Failed to fetch game";
       setError(errorMessage);
@@ -33,20 +92,33 @@ export const useBingoGame = () => {
       throw new Error("Invalid game ID");
     }
     try {
-      // Forward optional AbortSignal and control flags to the service so callers can cancel and enforce
+      // Ensure only the latest callNumber can update state; cancel prior in-flight
+      const { seq, signal } = startAction("callNumber");
+      // Forward AbortSignal and control flags; prefer internal signal to guard race
       const response = await gameService.callNumber(gameId, data.number, {
-        signal: data?.signal,
+        signal,
         requestId: data?.requestId,
         enforce: data?.enforce === true,
+        minIntervalMs: data?.minIntervalMs,
+        playAtEpoch: data?.playAtEpoch,
       });
       if (!response || !response.game) {
         throw new Error("No game data in response from call number");
       }
-      setGame(response.game);
-      setError(null);
+      if (seq === seqRef.current.callNumber) {
+        setGame(response.game);
+        setError(null);
+      }
       return response;
     } catch (error) {
       // Preserve original error so callers can detect abort/cancel (e.g. ERR_CANCELED)
+      const isCanceled =
+        error?.code === "ERR_CANCELED" ||
+        error?.name === "CanceledError" ||
+        /aborted|canceled/i.test(error?.message || "");
+      if (isCanceled) {
+        throw error;
+      }
       const errorMessage =
         error.response?.data?.error || error.message || "Failed to call number";
       setError(errorMessage);
@@ -62,6 +134,7 @@ export const useBingoGame = () => {
         throw new Error(errorMessage);
       }
       try {
+        const { seq } = startAction("checkBingo");
         const response = await gameService.checkBingo(
           gameId,
           cardId,
@@ -78,15 +151,17 @@ export const useBingoGame = () => {
         if (!response || !response.game) {
           throw new Error("No game data in response from check bingo");
         }
-        setGame(response.game);
-        setBingoStatus({
-          isBingo: response.isBingo,
-          winningPattern: response.winningPattern,
-          validBingoPatterns: response.validBingoPatterns,
-          winner: response.winner,
-          previousWinner: response.previousWinner,
-        });
-        setError(null);
+        if (seq === seqRef.current.checkBingo) {
+          setGame(response.game);
+          setBingoStatus({
+            isBingo: response.isBingo,
+            winningPattern: response.winningPattern,
+            validBingoPatterns: response.validBingoPatterns,
+            winner: response.winner,
+            previousWinner: response.previousWinner,
+          });
+          setError(null);
+        }
         return response;
       } catch (error) {
         const errorMessage =
@@ -112,12 +187,15 @@ export const useBingoGame = () => {
       throw new Error("Invalid game ID");
     }
     try {
+      const { seq } = startAction("selectWinner");
       const response = await gameService.selectWinner(gameId, data);
       if (!response || !response.game) {
         throw new Error("No game data in response from select winner");
       }
-      setGame(response.game);
-      setError(null);
+      if (seq === seqRef.current.selectWinner) {
+        setGame(response.game);
+        setError(null);
+      }
       return response;
     } catch (error) {
       const errorMessage =
@@ -135,6 +213,7 @@ export const useBingoGame = () => {
       throw new Error("Invalid game ID");
     }
     try {
+      const { seq } = startAction("finishGame");
       const response = await gameService.finishGame(gameId);
       console.log("useBingoGame.finishGame response:", response);
       if (!response) {
@@ -144,8 +223,10 @@ export const useBingoGame = () => {
       if (!gameData || !gameData._id) {
         throw new Error("No valid game data in response from finish game");
       }
-      setGame(gameData);
-      setError(null);
+      if (seq === seqRef.current.finishGame) {
+        setGame(gameData);
+        setError(null);
+      }
       return { game: gameData };
     } catch (error) {
       const errorMessage =

@@ -15,7 +15,7 @@ const ControlsPanel = ({
   cardId,
   setCardId,
   onPlayPause,
-  toggleAutoCall,          // ← NEW PROP
+  toggleAutoCall, // ← NEW PROP
   onNextClick,
   onFinish,
   onShuffle,
@@ -43,8 +43,8 @@ const ControlsPanel = ({
                 ? "bg-[#4caf50] hover:bg-[#43a047]"
                 : "bg-[#e9744c] hover:bg-[#f0b76a]"
             } text-black border-none px-4 py-2 font-bold rounded cursor-pointer text-sm transition-colors duration-300`}
-            onClick={toggleAutoCall}               // ← CALLS IT
-            disabled={!gameId || isGameOver || !isOnline}  // allow toggling even when paused
+            onClick={toggleAutoCall} // ← CALLS IT
+            disabled={!gameId || isGameOver || !isOnline} // allow toggling even when paused
           >
             Auto Call {isAutoCall ? "On" : "Off"}
           </button>
@@ -53,7 +53,7 @@ const ControlsPanel = ({
           <button
             className="bg-[#e9a64c] text-black border-none px-4 py-2 font-bold rounded cursor-pointer text-sm transition-colors duration-300 hover:bg-[#f0b76a]"
             onClick={onNextClick}
-            disabled={!gameId || isCallingNumber || !isPlaying || isGameOver || !isOnline}
+            disabled={!gameId || isCallingNumber || isGameOver || !isOnline}
           >
             {isCallingNumber ? "Calling..." : "Next"}
           </button>

@@ -55,6 +55,10 @@ const gameSchema = new mongoose.Schema({
   selectedWinnerRowIndices: { type: [Number], default: [] },
   forcedCallSequence: { type: [Number], default: [] },
   forcedCallIndex: { type: Number, default: 0 },
+  // Controls whether the server will accept auto next-call requests (no manual number specified)
+  autoCallEnabled: { type: Boolean, default: true },
+  // Server-enforced next allowed time for any subsequent calls (throttling survives restarts)
+  nextAllowedAt: { type: Date, default: null },
   targetWinCall: { type: Number, default: null },
   winnerCardNumbers: {
     type: [[{ type: mongoose.Schema.Types.Mixed }]],

@@ -1,5 +1,5 @@
 // src/services/sound.js
-import API from "./axios";
+// Note: We load audio directly from client public assets (no backend proxy)
 
 const MAX_CONCURRENT = 8;
 const SILENT_WAV =
@@ -15,6 +15,18 @@ class SoundService {
     this.ctx = new (window.AudioContext || window.webkitAudioContext)();
     this.gain = this.ctx.createGain();
     this.gain.connect(this.ctx.destination);
+    this.decoded = new Map(); // key -> AudioBuffer (decoded)
+  }
+
+  // Ensure audio context is running (required by some browsers to reduce latency)
+  async ensureContext() {
+    try {
+      if (this.ctx && this.ctx.state !== "running") {
+        await this.ctx.resume();
+      }
+    } catch {
+      /* noop */
+    }
   }
 
   /* --------------------------------------------------------------
@@ -32,10 +44,10 @@ class SoundService {
       "jackpot-running": "effects/jackpot-running.opus",
       "jackpot-congrats": "effects/jackpot-congrats.opus",
     };
-    if (map[key]) return `/sounds?path=${map[key]}`;
+    if (map[key]) return `/sounds/${map[key]}`;
     const m = /^number_(\d{1,2})$/.exec(key);
     if (m && +m[1] >= 1 && +m[1] <= 75)
-      return `/sounds?path=${folder}/${+m[1]}.opus`;
+      return `/sounds/${folder}/${+m[1]}.opus`;
     return null;
   }
 
@@ -48,7 +60,9 @@ class SoundService {
 
     const p = (async () => {
       try {
-        const { data } = await API.get(url, { responseType: "arraybuffer" });
+        const res = await fetch(url, { cache: "force-cache" });
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        const data = await res.arrayBuffer();
         const blob = new Blob([data], { type: "audio/ogg" });
         const blobUrl = URL.createObjectURL(blob);
         const audio = new Audio(blobUrl);
@@ -134,6 +148,8 @@ class SoundService {
      playSound – **exact same API as the old version**
   -------------------------------------------------------------- */
   playSound(key, options = {}) {
+    // Best effort: make sure context is resumed for low-latency start
+    this.ensureContext();
     // winner / loser priority (unchanged)
     if (key === "winner") {
       this.lastWinnerAt = Date.now();
@@ -142,7 +158,9 @@ class SoundService {
         try {
           lose.pause();
           lose.currentTime = 0;
-        } catch {}
+        } catch {
+          /* noop */
+        }
       }
     } else if (key === "you_didnt_win") {
       if (Date.now() - this.lastWinnerAt < 2000) return;
@@ -161,7 +179,7 @@ class SoundService {
   /* --------------------------------------------------------------
      Internal fast playback (HTMLAudio fallback + WebAudio fast-path)
   -------------------------------------------------------------- */
-  _playAudio(audio, { loop = false, stop = false } = {}) {
+  _playAudio(audio, { loop = false, stop = false, atMs = null } = {}) {
     if (stop) {
       audio.pause();
       audio.currentTime = 0;
@@ -170,25 +188,92 @@ class SoundService {
 
     // Prefer WebAudio when we have the raw buffer (zero latency)
     if (audio._buffer) {
+      const schedule = (buffer) => {
+        const src = this.ctx.createBufferSource();
+        src.buffer = buffer;
+        src.loop = loop;
+        src.connect(this.gain);
+        if (atMs && typeof performance !== "undefined") {
+          const nowMs = performance.now();
+          const deltaSec = Math.max(0, (atMs - nowMs) / 1000);
+          src.start(this.ctx.currentTime + deltaSec);
+        } else {
+          src.start(0);
+        }
+      };
+
+      const cached = this.decoded.get(audio.src);
+      if (cached) {
+        try {
+          schedule(cached);
+          return;
+        } catch {
+          /* fall through */
+        }
+      }
+
       this.ctx
         .decodeAudioData(audio._buffer.slice(0), (buffer) => {
-          const src = this.ctx.createBufferSource();
-          src.buffer = buffer;
-          src.loop = loop;
-          src.connect(this.gain);
-          src.start(0);
+          try {
+            this.decoded.set(audio.src, buffer);
+          } catch {
+            /* noop */
+          }
+          schedule(buffer);
         })
         .catch(() => {
           // fallback to HTMLAudio
           audio.loop = loop;
-          audio.currentTime = 0;
-          audio.play().catch(() => {});
+          try {
+            if (atMs && typeof performance !== "undefined") {
+              const delay = Math.max(0, atMs - performance.now());
+              setTimeout(() => {
+                audio.currentTime = 0;
+                audio.play().catch(() => {});
+              }, delay);
+            } else {
+              audio.currentTime = 0;
+              audio.play().catch(() => {});
+            }
+          } catch {
+            /* noop */
+          }
         });
     } else {
       audio.loop = loop;
-      audio.currentTime = 0;
-      audio.play().catch(() => {});
+      try {
+        if (atMs && typeof performance !== "undefined") {
+          const delay = Math.max(0, atMs - performance.now());
+          setTimeout(() => {
+            audio.currentTime = 0;
+            audio.play().catch(() => {});
+          }, delay);
+        } else {
+          audio.currentTime = 0;
+          audio.play().catch(() => {});
+        }
+      } catch {
+        /* noop */
+      }
     }
+  }
+
+  /* --------------------------------------------------------------
+     Schedule playback at an absolute high-res time (ms, performance.now)
+  -------------------------------------------------------------- */
+  playSoundAt(key, atMs, options = {}) {
+    const audio = this.audioCache[key];
+    if (!audio) {
+      const url = this._url(key, options.language || this.loadedLang || "am");
+      if (url)
+        this._load(key, url).then((a) =>
+          this._playAudio(a, { ...options, atMs })
+        );
+      return;
+    }
+    // Ensure context is resumed for low-latency scheduling
+    this.ensureContext();
+    this._playAudio(audio, { ...options, atMs });
   }
 
   /* --------------------------------------------------------------
@@ -209,7 +294,9 @@ class SoundService {
       const onEnded = () => {
         try {
           audio.removeEventListener("ended", onEnded);
-        } catch {}
+        } catch {
+          /* noop */
+        }
         resolve();
       };
       try {
@@ -224,7 +311,9 @@ class SoundService {
         const t = setTimeout(() => {
           try {
             audio.removeEventListener("ended", onEnded);
-          } catch {}
+          } catch {
+            /* noop */
+          }
           resolve();
         }, safetyMs);
 
@@ -232,7 +321,9 @@ class SoundService {
           console.error(`Error playing sound ${key}:`, err);
           try {
             audio.removeEventListener("ended", onEnded);
-          } catch {}
+          } catch {
+            /* noop */
+          }
           clearTimeout(t);
           resolve();
         });

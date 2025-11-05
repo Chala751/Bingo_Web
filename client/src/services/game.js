@@ -38,11 +38,13 @@ const gameService = {
   },
 
   // === GET GAME BY ID ===
-  getGame: async (id) => {
+  getGame: async (id, options = {}) => {
     try {
       if (!id) throw new Error("Game ID is required");
       console.log("gameService.getGame - Fetching game ID:", id);
-      const response = await API.get(`/games/${id}`);
+      const config = {};
+      if (options?.signal) config.signal = options.signal;
+      const response = await API.get(`/games/${id}`, config);
       console.log("gameService.getGame response:", response.data);
       if (!response.data.game) throw new Error("No game data returned");
       return response.data.game;
@@ -153,6 +155,12 @@ const gameService = {
       };
 
       const body = { number: parsedNumber, requestId, enforce };
+      if (Number.isFinite(options?.minIntervalMs)) {
+        body.minIntervalMs = options.minIntervalMs;
+      }
+      if (Number.isFinite(options?.playAtEpoch)) {
+        body.playAtEpoch = options.playAtEpoch;
+      }
 
       let response;
       if (API.requestWithRetry) {
@@ -251,6 +259,18 @@ const gameService = {
 
       // Body does NOT include number; server will choose forced/manual/random
       const body = { requestId };
+      if (Number.isFinite(options?.minIntervalMs)) {
+        body.minIntervalMs = options.minIntervalMs;
+      }
+      if (Number.isFinite(options?.playAtEpoch)) {
+        body.playAtEpoch = options.playAtEpoch;
+      }
+      if (options?.playNow === true) {
+        body.playNow = true;
+      }
+      if (options?.manual === true) {
+        body.manual = true;
+      }
 
       let response;
       if (API.requestWithRetry) {
@@ -561,6 +581,38 @@ const gameService = {
     } catch (error) {
       console.error(
         "updateGameStatus error:",
+        error.response?.data || error.message
+      );
+      throw error;
+    }
+  },
+
+  // === TOGGLE AUTO-CALL ===
+  setAutoCallEnabled: async (gameId, enabled) => {
+    try {
+      if (!gameId) throw new Error("Game ID is required");
+      const response = await API.patch(`/games/${gameId}/auto-call`, {
+        enabled: !!enabled,
+      });
+      return response.data.game || response.data;
+    } catch (error) {
+      console.error(
+        "setAutoCallEnabled error:",
+        error.response?.data || error.message
+      );
+      throw error;
+    }
+  },
+
+  // === RESTART GAME FROM NEW (CLEAR CALLED NUMBERS) ===
+  restartGame: async (gameId) => {
+    try {
+      if (!gameId) throw new Error("Game ID is required");
+      const response = await API.post(`/games/${gameId}/restart`);
+      return response.data.game || response.data;
+    } catch (error) {
+      console.error(
+        "restartGame error:",
         error.response?.data || error.message
       );
       throw error;

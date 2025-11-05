@@ -10,7 +10,9 @@ export default function useSoundEffects({ language }) {
 
   // Expose tiny API
   return {
-    play: (key, opts) => SoundService.play(key, { ...opts, language }),
+    play: (key, opts) => SoundService.playSound(key, { ...opts, language }),
+    playAwait: (key, opts) =>
+      SoundService.playSoundAwait(key, { ...opts, language }),
     stop: (key) => SoundService.stop(key),
   };
 }

@@ -44,30 +44,82 @@ export default function useNumberCalling(gameState, autoCallerOptions = {}) {
   // 1. Apply number – only after server confirmation
   // -----------------------------------------------------------------
   const applyCalledNumber = useCallback(
-    (num) => {
+    (num, opts = {}) => {
       const n = Number(num);
-      if (isNaN(n) || appliedNumbersRef.current.has(n)) return false;
+      if (isNaN(n)) return false;
 
-      calledNumbersSetRef.current.add(n);
-      appliedNumbersRef.current.add(n);
-
-      setCalledNumbers((prev) => [...prev, n]);
-      setLastCalledNumbers((prev) => [...new Set([n, ...prev])].slice(0, 5));
-      setCurrentNumber(n);
-
+      const atMs =
+        typeof opts.atMs === "number" && isFinite(opts.atMs) ? opts.atMs : null;
       const lang = gameData?.language || "am";
-      SoundService.playSound(`number_${n}`, { language: lang });
 
-      const gid = gameData?._id;
-      if (gid) {
-        sessionStorage.setItem(
-          `bingo_last_heard_${gid}`,
-          JSON.stringify({ number: n, ts: Date.now() })
-        );
-        lastHeardRef.current = { gameId: gid, number: n };
+      const applyNow = () => {
+        if (appliedNumbersRef.current.has(n)) return false;
+
+        calledNumbersSetRef.current.add(n);
+        appliedNumbersRef.current.add(n);
+
+        setCalledNumbers((prev) => [...prev, n]);
+        setLastCalledNumbers((prev) => [...new Set([n, ...prev])].slice(0, 5));
+        setCurrentNumber(n);
+
+        const gid = gameData?._id;
+        if (gid) {
+          sessionStorage.setItem(
+            `bingo_last_heard_${gid}`,
+            JSON.stringify({ number: n, ts: Date.now() })
+          );
+          lastHeardRef.current = { gameId: gid, number: n };
+        }
+        return true;
+      };
+
+      if (atMs && atMs > performance.now() + 10) {
+        // Schedule sound precisely at atMs (one-time)
+        try {
+          SoundService.playSoundAt(`number_${n}`, atMs, { language: lang });
+        } catch {
+          /* noop */
+        }
+
+        // Schedule UI update to land exactly at the same time as audio
+        const target = atMs;
+        const coarse = Math.max(0, target - performance.now() - 30);
+        if (coarse > 0) {
+          setTimeout(() => {
+            const spin = () => {
+              const t = performance.now();
+              if (t >= target - 1) {
+                applyNow();
+              } else {
+                requestAnimationFrame(spin);
+              }
+            };
+            requestAnimationFrame(spin);
+          }, coarse);
+        } else {
+          const spin = () => {
+            const t = performance.now();
+            if (t >= target - 1) {
+              applyNow();
+            } else {
+              requestAnimationFrame(spin);
+            }
+          };
+          requestAnimationFrame(spin);
+        }
+        return true; // accepted and scheduled
       }
 
-      return true;
+      // No scheduling provided: apply immediately and play now
+      const ok = applyNow();
+      if (ok) {
+        try {
+          SoundService.playSound(`number_${n}`, { language: lang });
+        } catch {
+          /* noop */
+        }
+      }
+      return ok;
     },
     [
       gameData,
@@ -82,9 +134,16 @@ export default function useNumberCalling(gameState, autoCallerOptions = {}) {
   // 2. Call number – **waits for server**, **returns success/failure**
   // -----------------------------------------------------------------
   const callNumber = useCallback(
-    async (number = null, { enforce = false } = {}) => {
+    async (
+      number = null,
+      { enforce = false, overridePlaying = false, signal: extSignal } = {}
+    ) => {
       if (!gameData?._id || inFlightCallRef.current) return false;
-      if (isGameOver || !isPlaying || gameData.status !== "active")
+      if (
+        isGameOver ||
+        (!overridePlaying && !isPlaying) ||
+        gameData.status !== "active"
+      )
         return false;
 
       const numToCall = number ?? pendingCallRef.current;
@@ -95,15 +154,27 @@ export default function useNumberCalling(gameState, autoCallerOptions = {}) {
       pendingCallRef.current = null;
 
       try {
+        const intervalMs = Math.max(
+          1000,
+          (autoCallerOptions?.speed || 8) * 1000
+        );
+        // Prefer a near-future schedule to avoid TOO_EARLY while keeping synced audio/UI
+        const leadMs = 1200;
+        const playAtEpoch = Date.now() + leadMs;
+        const atMs = performance.now() + leadMs;
+
         const resp = await gameService.callNumber(gameData._id, numToCall, {
           enforce,
-          signal: autoCallerOptions.signal,
+          signal: extSignal || autoCallerOptions.signal,
+          // Provide schedule hints so server can accept even before earliest
+          minIntervalMs: intervalMs,
+          playAtEpoch,
         });
 
         const called = resp.calledNumber;
         if (called) {
           // === SERVER CONFIRMED: Apply & update ===
-          applyCalledNumber(called);
+          applyCalledNumber(called, { atMs });
           setGameData((prev) => ({
             ...prev,
             ...resp.game,
@@ -134,18 +205,60 @@ export default function useNumberCalling(gameState, autoCallerOptions = {}) {
         );
         return false;
       } catch (err) {
-        console.error(`[callNumber] Failed to call ${numToCall}:`, err.message);
+        // Gracefully handle TOO_EARLY by waiting until nextAllowedAt
+        const code = err?.response?.data?.errorCode || err?.code;
+        if (err?.response?.status === 409 && code === "TOO_EARLY") {
+          const nextAllowedAt = Number(err?.response?.data?.nextAllowedAt);
+          if (Number.isFinite(nextAllowedAt)) {
+            const delay = Math.max(0, nextAllowedAt - Date.now() + 30);
+            await new Promise((r) => setTimeout(r, delay));
+            // Re-attempt with a small synchronous cushion and schedule hints
+            const intervalMs = Math.max(
+              1000,
+              (autoCallerOptions?.speed || 8) * 1000
+            );
+            const cushion = 120; // ms after allowed time
+            const atMs2 = performance.now() + cushion;
+            const playAtEpoch2 = Date.now() + cushion;
+            try {
+              const resp2 = await gameService.callNumber(
+                gameData._id,
+                numToCall,
+                {
+                  enforce,
+                  signal: extSignal || autoCallerOptions.signal,
+                  minIntervalMs: intervalMs,
+                  playAtEpoch: playAtEpoch2,
+                }
+              );
+              const called2 = resp2.calledNumber;
+              if (called2) {
+                applyCalledNumber(called2, { atMs: atMs2 });
+                setGameData((prev) => ({
+                  ...prev,
+                  ...resp2.game,
+                  calledNumbers:
+                    resp2.game?.calledNumbers || prev.calledNumbers,
+                  calledNumbersLog:
+                    resp2.game?.calledNumbersLog || prev.calledNumbersLog,
+                }));
+                lastConfirmedCallTimeRef.current = performance.now();
+                return true;
+              }
+            } catch {
+              // fall through to failure path
+            }
+          }
+        }
 
         // === FAILURE: DO NOT APPLY, DO NOT ADVANCE ===
-        // Let caller retry
-        if (err.name !== "CanceledError") {
+        if (err?.name !== "CanceledError") {
           const status = err?.response?.status;
           const reason = err?.response?.data?.reason;
           if (status === 412 || reason === "ALREADY_CALLED") {
-            // Drop it and let server choose next number
             pendingCallRef.current = null;
           } else {
-            pendingCallRef.current = numToCall; // retry same number
+            pendingCallRef.current = numToCall; // retry same number later
           }
         }
         return false;
@@ -162,61 +275,126 @@ export default function useNumberCalling(gameState, autoCallerOptions = {}) {
       setGameData,
       pendingCallRef,
       autoCallerOptions?.signal,
+      autoCallerOptions?.speed,
     ]
   );
 
   // -----------------------------------------------------------------
   // 2b. Server-decided call – no client-side number selection
   // -----------------------------------------------------------------
-  const callNextFromServer = useCallback(async () => {
-    if (!gameData?._id || inFlightCallRef.current) return false;
-    if (isGameOver || !isPlaying || gameData.status !== "active") return false;
-
-    setIsCallingNumber(true);
-    inFlightCallRef.current = true;
-    pendingCallRef.current = null;
-    try {
-      const resp = await gameService.callNextNumber(gameData._id, {
-        signal: autoCallerOptions.signal,
-      });
-      const called = resp.calledNumber;
-      if (!called) {
-        if (resp?.game)
-          setGameData((prev) => ({
-            ...prev,
-            ...resp.game,
-            calledNumbers: resp.game?.calledNumbers || prev.calledNumbers,
-            calledNumbersLog:
-              resp.game?.calledNumbersLog || prev.calledNumbersLog,
-          }));
+  const callNextFromServer = useCallback(
+    async ({
+      overridePlaying = false,
+      signal: extSignal,
+      atMs = null,
+      minIntervalMs = null,
+      playAtEpoch = null,
+      playNow = false,
+      manual = false,
+    } = {}) => {
+      if (!gameData?._id || inFlightCallRef.current) return false;
+      if (
+        isGameOver ||
+        (!overridePlaying && !isPlaying) ||
+        gameData.status !== "active"
+      )
         return false;
+
+      setIsCallingNumber(true);
+      inFlightCallRef.current = true;
+      pendingCallRef.current = null;
+      try {
+        const interval = Number.isFinite(minIntervalMs)
+          ? minIntervalMs
+          : Math.max(1000, (autoCallerOptions?.speed || 8) * 1000);
+
+        // If caller didn't provide schedule, create a safe near-future one
+        let targetAtMs = atMs;
+        let targetPlayAt = playAtEpoch;
+        if (!Number.isFinite(targetAtMs) || !Number.isFinite(targetPlayAt)) {
+          const lead = 1200; // ms
+          targetAtMs = performance.now() + lead;
+          targetPlayAt = Date.now() + lead;
+        }
+
+        const resp = await gameService.callNextNumber(gameData._id, {
+          signal: extSignal || autoCallerOptions.signal,
+          minIntervalMs: interval,
+          playAtEpoch: targetPlayAt,
+          playNow,
+          manual,
+        });
+        const called = resp.calledNumber;
+        if (!called) {
+          if (resp?.game)
+            setGameData((prev) => ({
+              ...prev,
+              ...resp.game,
+              calledNumbers: resp.game?.calledNumbers || prev.calledNumbers,
+              calledNumbersLog:
+                resp.game?.calledNumbersLog || prev.calledNumbersLog,
+            }));
+          return false;
+        }
+
+        applyCalledNumber(called, { atMs: targetAtMs });
+        setGameData((prev) => ({
+          ...prev,
+          ...resp.game,
+          calledNumbers: resp.game?.calledNumbers || prev.calledNumbers,
+          calledNumbersLog:
+            resp.game?.calledNumbersLog || prev.calledNumbersLog,
+        }));
+
+        lastConfirmedCallTimeRef.current = performance.now();
+        return true;
+      } catch (err) {
+        // Handle TOO_EARLY gracefully by scheduling at server-provided time
+        const code = err?.response?.data?.errorCode || err?.code;
+        if (err?.response?.status === 409 && code === "TOO_EARLY") {
+          const nextAllowedAt = Number(err?.response?.data?.nextAllowedAt);
+          if (Number.isFinite(nextAllowedAt)) {
+            const delay = Math.max(0, nextAllowedAt - Date.now() + 30);
+            await new Promise((r) => setTimeout(r, delay));
+            // After waiting, set a tiny cushion and try again with precise schedule
+            const cushion = 120;
+            const atMs2 = performance.now() + cushion;
+            const playAtEpoch2 = Date.now() + cushion;
+            try {
+              const ok = await callNextFromServer({
+                overridePlaying,
+                signal: extSignal,
+                atMs: atMs2,
+                minIntervalMs: Number.isFinite(minIntervalMs)
+                  ? minIntervalMs
+                  : Math.max(1000, (autoCallerOptions?.speed || 8) * 1000),
+                playAtEpoch: playAtEpoch2,
+                playNow,
+                manual,
+              });
+              // If we scheduled/handled, treat as success for the caller (avoid fallback/manual)
+              return ok;
+            } catch {
+              // fall through
+            }
+          }
+        }
+        return false;
+      } finally {
+        setIsCallingNumber(false);
+        inFlightCallRef.current = false;
       }
-
-      applyCalledNumber(called);
-      setGameData((prev) => ({
-        ...prev,
-        ...resp.game,
-        calledNumbers: resp.game?.calledNumbers || prev.calledNumbers,
-        calledNumbersLog: resp.game?.calledNumbersLog || prev.calledNumbersLog,
-      }));
-
-      lastConfirmedCallTimeRef.current = performance.now();
-      return true;
-    } catch (err) {
-      console.error(`[callNextFromServer] Failed:`, err?.message || err);
-      return false;
-    } finally {
-      setIsCallingNumber(false);
-      inFlightCallRef.current = false;
-    }
-  }, [
-    gameData,
-    isPlaying,
-    isGameOver,
-    applyCalledNumber,
-    setGameData,
-    autoCallerOptions?.signal,
-  ]);
+    },
+    [
+      gameData,
+      isPlaying,
+      isGameOver,
+      applyCalledNumber,
+      setGameData,
+      autoCallerOptions?.signal,
+      autoCallerOptions?.speed,
+    ]
+  );
 
   // -----------------------------------------------------------------
   // 3. Generate next random number (client-side only)
@@ -254,7 +432,7 @@ export default function useNumberCalling(gameState, autoCallerOptions = {}) {
       if (!num) return false;
 
       pendingCallRef.current = num;
-      return await callNumber(num, { enforce: true });
+      return await callNumber(num, { enforce: true, overridePlaying: true });
     },
     [isCallingNumber, generateNextNumber, callNumber]
   );

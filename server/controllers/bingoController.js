@@ -19,6 +19,17 @@ import JackpotLog from "../models/JackpotLog.js";
 import Card from "../models/Card.js";
 import GameLog from "../models/GameLog.js";
 import FutureWinner from "../models/FutureWinner.js";
+import {
+  emitNumberCalled,
+  roomHasClients,
+  clearDeferredForGame,
+} from "../socket.js";
+
+// In-memory guard to prevent burst calls even if client omits minIntervalMs
+// Stores last known preferred interval per game (from client) to enforce spacing on server
+const preferredIntervalByGame = new Map();
+// Track the last emit/play time per game to enforce spacing even across transient DB failures
+const lastEmitAtByGame = new Map();
 
 export const getCard = async (req, res) => {
   try {
@@ -36,21 +47,27 @@ export const getCard = async (req, res) => {
 export const callNumber = async (req, res, next) => {
   try {
     const { gameId } = req.params;
-    // Optional idempotency key to survive network retries/aborts
-    const requestId =
-      req.headers["x-request-id"] || req.body?.requestId || null;
-    // If the client is resuming an interrupted/manual number, it can enforce
-    // that exact number must be used; otherwise the server should not call a
-    // different number in this tick.
-    const enforceRequested =
-      req.body?.enforce === true || req.body?.mustMatch === true;
-
     if (!gameId) {
       return res.status(400).json({ message: "Game ID is required" });
     }
 
-    // If an idempotent requestId is provided and we've processed it before,
-    // return the previous result to avoid duplicate state/log writes.
+    // Playback scheduling from client
+    const providedPlayAtEpoch = (() => {
+      try {
+        const p = req?.body?.playAtEpoch;
+        if (typeof p === "number" && isFinite(p)) return p;
+        const after = Number(req?.body?.playAfterMs || 0);
+        if (after > 0) return Date.now() + after;
+      } catch {}
+      return null;
+    })();
+
+    const requestId =
+      req.headers["x-request-id"] || req.body?.requestId || null;
+    const enforceRequested =
+      req.body?.enforce === true || req.body?.mustMatch === true;
+
+    // Idempotency: if the request was already processed, return previous result
     if (requestId) {
       const previous = await GameLog.findOne({
         gameId,
@@ -60,7 +77,6 @@ export const callNumber = async (req, res, next) => {
         .sort({ _id: -1 })
         .lean();
       if (previous) {
-        // Return the current game state and the previously called number
         const safeGame = await Game.findById(gameId)
           .select(
             "gameNumber status calledNumbers calledNumbersLog forcedCallIndex pattern forcedPattern moderatorWinnerCardId prizePool"
@@ -73,60 +89,189 @@ export const callNumber = async (req, res, next) => {
           isUsingForcedSequence: previous.details?.type === "forced",
           patternUsed: safeGame?.forcedPattern || safeGame?.pattern,
           forcedCallIndex: safeGame?.forcedCallIndex || 0,
-          forcedCallSequenceLength: safeGame?.forcedCallLength || 0,
+          forcedCallSequenceLength: previous.details?.forcedCallLength || 0,
           idempotent: true,
         });
       }
     }
 
-    // Try to acquire a short lock to ensure only one call is processed at a time.
-    // Uses a soft TTL to avoid deadlocks if a request crashes.
+    // Acquire call lock
     const lockTTLms = 3000;
     const lockUntil = new Date(Date.now() + lockTTLms);
     const lockDoc = await Game.findOneAndUpdate(
       {
         _id: gameId,
         status: "active",
-        $or: [{ callLock: { $exists: false } }, { callLock: { $lte: new Date() } }],
+        $or: [
+          { callLock: { $exists: false } },
+          { callLock: { $lte: new Date() } },
+        ],
       },
       { $set: { callLock: lockUntil } },
       { new: true }
     )
       .select(
-        "gameNumber status calledNumbers calledNumbersLog forcedCallSequence forcedCallIndex pattern forcedPattern moderatorWinnerCardId prizePool callLock"
+        "gameNumber status calledNumbers calledNumbersLog forcedCallSequence forcedCallIndex pattern forcedPattern moderatorWinnerCardId prizePool callLock cashierId autoCallEnabled nextAllowedAt"
       )
       .lean();
 
     if (!lockDoc) {
-      // Another call is in progress; ask client to retry shortly (backoff)
       return res.status(409).json({
         message: "Another call is currently being processed. Please retry.",
         errorCode: "CALL_IN_PROGRESS",
       });
     }
 
-  // Load only essential fields (from the doc we just locked)
     const game = lockDoc;
+
+    // Reject auto queue if auto-call disabled (manual still allowed)
+    const requestedNumber = Number(req.body?.number);
+    const hasRequested = !isNaN(requestedNumber);
+    const isManualTrigger = req?.body?.manual === true;
+    if (game.autoCallEnabled === false && !hasRequested && !isManualTrigger) {
+      await Game.findByIdAndUpdate(gameId, { $unset: { callLock: "" } });
+      const safeGame = await Game.findById(gameId)
+        .select(
+          "gameNumber status calledNumbers calledNumbersLog forcedCallIndex pattern forcedPattern moderatorWinnerCardId prizePool"
+        )
+        .lean();
+      await GameLog.create({
+        gameId,
+        action: "callNumber",
+        status: "blocked",
+        details: { reason: "AUTO_CALL_DISABLED", timestamp: new Date() },
+      });
+      return res.status(423).json({
+        message: "Auto call is disabled",
+        errorCode: "AUTO_CALL_DISABLED",
+        game: safeGame,
+      });
+    }
 
     if (!game) return res.status(404).json({ message: "Game not found" });
     if (game.status !== "active")
       return res.status(400).json({ message: `Game is ${game.status}` });
 
-  let nextNumber;
-  let callSource = "random";
-  let isUsingForcedSequence = false;
+    // Ensure a listener exists (cashier room)
+    try {
+      const cashierRoom = game?.cashierId?.toString();
+      if (cashierRoom && !roomHasClients(cashierRoom)) {
+        await Game.findByIdAndUpdate(gameId, { $unset: { callLock: "" } });
+        return res.status(409).json({
+          message: "No active client connected. Waiting for network.",
+          errorCode: "NO_ACTIVE_CLIENT",
+        });
+      }
+    } catch (e) {
+      console.warn(
+        "[callNumber] roomHasClients check failed:",
+        e?.message || e
+      );
+    }
 
+    // Interval enforcement unless explicitly overridden by playNow
+    if (req?.body?.playNow !== true) {
+      try {
+        const clientInterval = Math.max(
+          0,
+          Number(req?.body?.minIntervalMs || 0)
+        );
+        if (clientInterval > 0)
+          preferredIntervalByGame.set(gameId, clientInterval);
+
+        let effIntervalMs = clientInterval;
+        if (!effIntervalMs) {
+          const remembered = preferredIntervalByGame.get(gameId);
+          if (Number.isFinite(remembered) && remembered > 0) {
+            effIntervalMs = remembered;
+          } else if (
+            Array.isArray(game?.calledNumbersLog) &&
+            game.calledNumbersLog.length >= 2
+          ) {
+            const last =
+              game.calledNumbersLog[game.calledNumbersLog.length - 1];
+            const prev =
+              game.calledNumbersLog[game.calledNumbersLog.length - 2];
+            const lastTs = last?.calledAt
+              ? new Date(last.calledAt).getTime()
+              : null;
+            const prevTs = prev?.calledAt
+              ? new Date(prev.calledAt).getTime()
+              : null;
+            if (Number.isFinite(lastTs) && Number.isFinite(prevTs)) {
+              const derived = Math.max(0, lastTs - prevTs);
+              if (derived > 0) effIntervalMs = derived;
+            }
+          }
+        }
+
+        if (effIntervalMs > 0) {
+          const lastLog = Array.isArray(game?.calledNumbersLog)
+            ? game.calledNumbersLog[game.calledNumbersLog.length - 1]
+            : null;
+          const lastTsLog = lastLog?.calledAt
+            ? new Date(lastLog.calledAt).getTime()
+            : null;
+          const lastEmitTs = Number(lastEmitAtByGame.get(gameId)) || null;
+          const lastTs = [lastTsLog, lastEmitTs].filter(Number.isFinite).length
+            ? Math.max(
+                ...[lastTsLog, lastEmitTs].filter((v) =>
+                  Number.isFinite(Number(v))
+                )
+              )
+            : null;
+
+          const persistedNext = game?.nextAllowedAt
+            ? new Date(game.nextAllowedAt).getTime()
+            : null;
+
+          if (Number.isFinite(lastTs) || Number.isFinite(persistedNext)) {
+            let earliest = Number.isFinite(lastTs)
+              ? lastTs + effIntervalMs
+              : null;
+            if (Number.isFinite(persistedNext)) {
+              earliest = Number.isFinite(earliest)
+                ? Math.max(earliest, persistedNext)
+                : persistedNext;
+            }
+            if (Number.isFinite(earliest)) {
+              const nowTs = Date.now();
+              const candidatePlayAt = providedPlayAtEpoch || null;
+              const allowsEarly =
+                typeof candidatePlayAt === "number" &&
+                candidatePlayAt >= earliest;
+              if (!allowsEarly && nowTs < earliest - 10) {
+                await Game.findByIdAndUpdate(gameId, {
+                  $unset: { callLock: "" },
+                });
+                return res.status(409).json({
+                  message: "Too early to call next number",
+                  errorCode: "TOO_EARLY",
+                  nextAllowedAt: earliest,
+                });
+              }
+            }
+          }
+        }
+      } catch (e) {
+        console.warn("[callNumber] minInterval guard failed:", e?.message || e);
+      }
+    }
+
+    // Decide next number
     const calledNumbersCopy = game.calledNumbers || [];
     const callsMade = calledNumbersCopy.length;
+    let nextNumber;
+    let callSource = "random";
+    let isUsingForcedSequence = false;
 
-    // --- Forced sequence logic ---
+    // Use forced sequence sometimes while still reserving them
     if (
       game.forcedCallSequence?.length &&
       game.forcedCallIndex < game.forcedCallSequence.length
     ) {
       const remainingForced =
         game.forcedCallSequence.length - game.forcedCallIndex;
-
       if (callsMade + remainingForced >= 14 || Math.random() < 0.4) {
         nextNumber = game.forcedCallSequence[game.forcedCallIndex];
         callSource = "forced";
@@ -134,22 +279,17 @@ export const callNumber = async (req, res, next) => {
       }
     }
 
-    // --- Manual override (honor requested number if valid and not called) ---
-    const requestedNumber = Number(req.body?.number);
-    const hasRequested = !isNaN(requestedNumber);
+    // Manual override if provided and valid
     const requestedValid =
       hasRequested && requestedNumber >= 1 && requestedNumber <= 75;
     const alreadyCalled = calledNumbersCopy.includes(requestedNumber);
     if (requestedValid && !alreadyCalled) {
       nextNumber = requestedNumber;
       callSource = "manual";
-      isUsingForcedSequence = false; // manual takes precedence
+      isUsingForcedSequence = false;
     }
 
-    // If the client explicitly enforces a requested number and it's not usable
-    // (invalid or already called), do NOT pick a different number.
     if (enforceRequested && (!requestedValid || alreadyCalled)) {
-      // Release the lock before returning
       await Game.findByIdAndUpdate(gameId, { $unset: { callLock: "" } });
       const safeGame = await Game.findById(gameId)
         .select(
@@ -167,42 +307,33 @@ export const callNumber = async (req, res, next) => {
             ? "requested number already called"
             : "requested number invalid",
           enforce: true,
-          timestamp: new Date(),
         },
       });
       return res.status(412).json({
         message: "Requested number cannot be honored",
         errorCode: "REQUESTED_NUMBER_REJECTED",
-        reason: requestedValid
-          ? "ALREADY_CALLED"
-          : "INVALID_NUMBER",
+        reason: requestedValid ? "ALREADY_CALLED" : "INVALID_NUMBER",
         game: safeGame,
       });
     }
 
-    // --- Random number if no forced/manual number ---
-    if (!nextNumber) {
-      const remainingNumbers = Array.from(
-        { length: 75 },
-        (_, i) => i + 1
-      ).filter(
-        (n) =>
-          !calledNumbersCopy.includes(n) &&
-          !(game.forcedCallSequence || []).includes(n)
+    // Random selection if still not decided
+    if (typeof nextNumber !== "number") {
+      const all = Array.from({ length: 75 }, (_, i) => i + 1);
+      const blacklist = new Set([...(game.forcedCallSequence || [])]);
+      const remainingNumbers = all.filter(
+        (n) => !calledNumbersCopy.includes(n) && !blacklist.has(n)
       );
-
       if (!remainingNumbers.length)
         return res.status(400).json({ message: "No numbers left to call" });
-
       nextNumber =
         remainingNumbers[Math.floor(Math.random() * remainingNumbers.length)];
       callSource = "random";
+      isUsingForcedSequence = false;
     }
 
-    // Idempotency/duplicate guard: if the number is already in calledNumbers,
-    // return the current game state without pushing duplicate logs or indexes.
-    if (calledNumbersCopy.includes(nextNumber)) {
-      // Release the lock before returning
+    // Duplicate guard
+    if ((game.calledNumbers || []).includes(nextNumber)) {
       await Game.findByIdAndUpdate(gameId, { $unset: { callLock: "" } });
       const safeGame = await Game.findById(gameId)
         .select(
@@ -224,7 +355,7 @@ export const callNumber = async (req, res, next) => {
       return res.json({
         game: safeGame,
         calledNumber: nextNumber,
-        callSource: callSource,
+        callSource,
         isUsingForcedSequence,
         patternUsed: game.forcedPattern || game.pattern,
         forcedCallIndex: safeGame.forcedCallIndex,
@@ -233,44 +364,41 @@ export const callNumber = async (req, res, next) => {
       });
     }
 
-    // --- Atomic update to prevent duplicate numbers ---
-    // Use two-step logic to avoid duplicate log entries if the number was added in between
+    // Persist number
     const updateData = {
-      $addToSet: { calledNumbers: nextNumber }, // ensures uniqueness
-      // Only increment forcedCallIndex when actually using forced sequence AND this is a fresh add
+      $addToSet: { calledNumbers: nextNumber },
       ...(isUsingForcedSequence ? { $inc: { forcedCallIndex: 1 } } : {}),
     };
-
     const afterAdd = await Game.findByIdAndUpdate(gameId, updateData, {
       new: true,
       runValidators: true,
     })
       .select(
-        "gameNumber status calledNumbers calledNumbersLog forcedCallIndex pattern forcedPattern moderatorWinnerCardId prizePool"
+        "gameNumber status calledNumbers calledNumbersLog forcedCallIndex pattern forcedPattern moderatorWinnerCardId prizePool cashierId"
       )
       .lean();
 
-    // Only push a log row if our add actually resulted in the number present as the latest call
-    let doPushLog = false;
-    if (afterAdd?.calledNumbers?.includes(nextNumber)) {
-      doPushLog = true;
-    }
-
     let updatedGame = afterAdd;
-    if (doPushLog) {
+    if (afterAdd?.calledNumbers?.includes(nextNumber)) {
       const pushLogUpdate = await Game.findByIdAndUpdate(
         gameId,
-        { $push: { calledNumbersLog: { number: nextNumber, calledAt: new Date() } } },
+        {
+          $push: {
+            calledNumbersLog: {
+              number: nextNumber,
+              calledAt: new Date(providedPlayAtEpoch || Date.now()),
+            },
+          },
+        },
         { new: true, runValidators: true }
       )
         .select(
-          "gameNumber status calledNumbers calledNumbersLog forcedCallIndex pattern forcedPattern moderatorWinnerCardId prizePool"
+          "gameNumber status calledNumbers calledNumbersLog forcedCallIndex pattern forcedPattern moderatorWinnerCardId prizePool cashierId"
         )
         .lean();
       updatedGame = pushLogUpdate || afterAdd;
     }
 
-    // --- Log the action ---
     await GameLog.create({
       gameId,
       action: "callNumber",
@@ -287,6 +415,61 @@ export const callNumber = async (req, res, next) => {
       },
     });
 
+    // Emit
+    try {
+      const cashierRoom =
+        updatedGame?.cashierId?.toString() || lockDoc?.cashierId?.toString();
+      if (cashierRoom) {
+        const playAtEpoch = providedPlayAtEpoch || null;
+        const effectiveEmitTs = Number.isFinite(playAtEpoch)
+          ? playAtEpoch
+          : Date.now();
+        try {
+          lastEmitAtByGame.set(gameId, effectiveEmitTs);
+        } catch {}
+
+        // Persist nextAllowedAt
+        try {
+          const clientInterval = Math.max(
+            0,
+            Number(req?.body?.minIntervalMs || 0)
+          );
+          const remembered = preferredIntervalByGame.get(gameId) || 0;
+          const effIntervalMs = clientInterval || remembered || 0;
+          if (effIntervalMs > 0) {
+            await Game.findByIdAndUpdate(gameId, {
+              $set: {
+                nextAllowedAt: new Date(effectiveEmitTs + effIntervalMs),
+              },
+            }).lean();
+          }
+        } catch (e) {
+          console.warn(
+            "[callNumber] Failed to persist nextAllowedAt:",
+            e?.message || e
+          );
+        }
+
+        emitNumberCalled(cashierRoom, {
+          gameId,
+          gameNumber: updatedGame?.gameNumber,
+          calledNumber: nextNumber,
+          playAtEpoch: playAtEpoch || undefined,
+          game: {
+            _id: gameId,
+            gameNumber: updatedGame?.gameNumber,
+            status: updatedGame?.status,
+            calledNumbers: updatedGame?.calledNumbers,
+            calledNumbersLog: updatedGame?.calledNumbersLog,
+            forcedCallIndex: updatedGame?.forcedCallIndex,
+            pattern: updatedGame?.forcedPattern || updatedGame?.pattern,
+          },
+        });
+      }
+    } catch (e) {
+      console.warn("[callNumber] Socket emit failed:", e?.message || e);
+    }
+
     return res.json({
       game: updatedGame,
       calledNumber: nextNumber,
@@ -301,11 +484,13 @@ export const callNumber = async (req, res, next) => {
     console.error("[callNumber] ❌ ERROR:", err);
     return res.status(500).json({ message: "Internal server error" });
   } finally {
-    // Ensure the call lock is released in all cases
     const { gameId } = req.params || {};
     if (gameId) {
       try {
-        await Game.findByIdAndUpdate(gameId, { $unset: { callLock: "" } });
+        const game = await Game.findById(gameId).select("callLock").lean();
+        if (game?.callLock) {
+          await Game.findByIdAndUpdate(gameId, { $unset: { callLock: "" } });
+        }
       } catch (e) {
         console.warn("[callNumber] Failed to release call lock:", e?.message);
       }
@@ -1050,6 +1235,149 @@ export const updateGameStatus = async (req, res, next) => {
     await GameLog.create({
       gameId: req.params.gameId || gameId,
       action: "updateGameStatus",
+      status: "failed",
+      details: { error: error.message || "Internal server error" },
+    });
+    next(error);
+  }
+};
+
+// Toggle auto-call behavior for a game. When disabled, server will reject auto next-call
+// requests (i.e., requests without an explicit number). Manual calls remain allowed.
+export const setAutoCallEnabled = async (req, res, next) => {
+  try {
+    const { id: gameId } = req.params;
+    const { enabled } = req.body;
+
+    await getCashierIdFromUser(req, res, () => {});
+    const cashierId = req.cashierId;
+
+    if (!mongoose.isValidObjectId(gameId)) {
+      return res.status(400).json({
+        message: "Invalid game ID format",
+        errorCode: "INVALID_GAME_ID",
+      });
+    }
+
+    if (typeof enabled !== "boolean") {
+      return res.status(400).json({
+        message: "'enabled' boolean body is required",
+        errorCode: "INVALID_BODY",
+      });
+    }
+
+    const game = await Game.findOneAndUpdate(
+      { _id: gameId, cashierId },
+      { autoCallEnabled: enabled },
+      { new: true }
+    )
+      .select("gameNumber autoCallEnabled status")
+      .lean();
+
+    if (!game) {
+      return res.status(404).json({
+        message: "Game not found or unauthorized",
+        errorCode: "GAME_NOT_FOUND",
+      });
+    }
+
+    // If disabling, proactively clear any deferred next-call timers
+    if (!enabled) {
+      clearDeferredForGame(gameId);
+    }
+
+    await GameLog.create({
+      gameId,
+      action: "setAutoCallEnabled",
+      status: "success",
+      details: { newValue: enabled, timestamp: new Date() },
+    });
+
+    res.json({
+      message: `Auto-call ${enabled ? "enabled" : "disabled"} for game ${
+        game.gameNumber
+      }`,
+      game,
+    });
+  } catch (error) {
+    console.error("[setAutoCallEnabled] Error:", error);
+    await GameLog.create({
+      gameId: req.params.id,
+      action: "setAutoCallEnabled",
+      status: "failed",
+      details: { error: error.message || "Internal server error" },
+    });
+    next(error);
+  }
+};
+
+// Restart a game from new: clear called numbers and logs and set active status
+// Preserve configured winner queue (forcedCallSequence), but reset the index to 0
+// so the configured sequence plays from the beginning on restart.
+export const restartGame = async (req, res, next) => {
+  try {
+    const { id: gameId } = req.params;
+
+    await getCashierIdFromUser(req, res, () => {});
+    const cashierId = req.cashierId;
+
+    if (!mongoose.isValidObjectId(gameId)) {
+      return res.status(400).json({
+        message: "Invalid game ID format",
+        errorCode: "INVALID_GAME_ID",
+      });
+    }
+
+    // Clear any deferred timers and in-memory pacing
+    try {
+      clearDeferredForGame(gameId);
+      preferredIntervalByGame.delete(gameId);
+      lastEmitAtByGame.delete(gameId);
+    } catch {
+      /* noop */
+    }
+
+    const game = await Game.findOneAndUpdate(
+      { _id: gameId, cashierId },
+      {
+        $set: {
+          calledNumbers: [],
+          calledNumbersLog: [],
+          forcedCallIndex: 0, // Start forced sequence from beginning
+          status: "active",
+        },
+        $unset: { callLock: "", nextAllowedAt: "" },
+      },
+      { new: true, runValidators: true }
+    )
+      .select(
+        "gameNumber status calledNumbers calledNumbersLog forcedCallIndex forcedCallSequence autoCallEnabled"
+      )
+      .lean();
+
+    if (!game) {
+      return res.status(404).json({
+        message: "Game not found or unauthorized",
+        errorCode: "GAME_NOT_FOUND",
+      });
+    }
+
+    await GameLog.create({
+      gameId,
+      action: "restartGame",
+      status: "success",
+      details: { timestamp: new Date() },
+    });
+
+    res.json({
+      message: `Game ${game.gameNumber} restarted from new`,
+      game,
+    });
+  } catch (error) {
+    console.error("[restartGame] Error:", error);
+    await GameLog.create({
+      gameId: req.params.id,
+      action: "restartGame",
       status: "failed",
       details: { error: error.message || "Internal server error" },
     });
