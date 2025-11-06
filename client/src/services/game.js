@@ -308,7 +308,8 @@ const gameService = {
   },
 
   // === CHECK BINGO ===
-  checkBingo: async (gameId, cardId, preferredPattern = null) => {
+  // options: { signal?, retries?, backoff?, timeout? }
+  checkBingo: async (gameId, cardId, preferredPattern = null, options = {}) => {
     try {
       if (!gameId) throw new Error("Game ID is required");
       if (!cardId || isNaN(cardId))
@@ -322,7 +323,25 @@ const gameService = {
         body
       );
 
-      const response = await API.post(`/games/${gameId}/check-bingo`, body);
+      let response;
+      if (API.requestWithRetry) {
+        response = await API.requestWithRetry(
+          {
+            method: "post",
+            url: `/games/${gameId}/check-bingo`,
+            data: body,
+          },
+          {
+            retries: Number.isFinite(options.retries) ? options.retries : 1,
+            backoff: Number.isFinite(options.backoff) ? options.backoff : 250,
+            timeout: Number.isFinite(options.timeout) ? options.timeout : 6000,
+            signal: options.signal,
+          }
+        );
+      } else {
+        const config = options.signal ? { signal: options.signal } : {};
+        response = await API.post(`/games/${gameId}/check-bingo`, body, config);
+      }
 
       console.log("[checkBingo] Result:", {
         isBingo: response.data.isBingo,

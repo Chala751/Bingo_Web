@@ -181,6 +181,77 @@ const BingoModals = ({
     return grid;
   };
 
+  // Heuristic: ensure a 5x5 grid aligns with B-I-N-G-O column ranges. If rows/cols are swapped, transpose it.
+  const normalizeGridOrientation = (grid) => {
+    try {
+      if (!Array.isArray(grid) || grid.length !== 5) return grid;
+      if (grid.some((row) => !Array.isArray(row) || row.length !== 5))
+        return grid;
+
+      const inRange = (v, min, max) => {
+        const n = typeof v === "number" ? v : Number(v);
+        return Number.isFinite(n) && n >= min && n <= max;
+      };
+
+      // Score how many cells per column fall into expected B/I/N/G/O ranges
+      const colScore = () => {
+        let s = 0;
+        for (let c = 0; c < 5; c++) {
+          const min = c * 15 + 1;
+          const max = c * 15 + 15;
+          for (let r = 0; r < 5; r++)
+            if (grid[r][c] !== "FREE")
+              s += inRange(grid[r][c], min, max) ? 1 : 0;
+        }
+        return s;
+      };
+      // If the grid is transposed, rows will match the B/I/N/G/O ranges instead of columns
+      const rowScore = () => {
+        let s = 0;
+        for (let r = 0; r < 5; r++) {
+          const min = r * 15 + 1;
+          const max = r * 15 + 15;
+          for (let c = 0; c < 5; c++)
+            if (grid[r][c] !== "FREE")
+              s += inRange(grid[r][c], min, max) ? 1 : 0;
+        }
+        return s;
+      };
+
+      const cScore = colScore();
+      const rScore = rowScore();
+      // If rows match the expected ranges more than columns, transpose
+      if (rScore > cScore) {
+        const transposed = Array.from({ length: 5 }, (_, r) =>
+          Array.from({ length: 5 }, (_, c) => grid[c][r])
+        );
+        // Ensure center FREE semantics are preserved
+        if (transposed[2][2] === undefined || transposed[2][2] === null) {
+          transposed[2][2] = "FREE";
+        }
+        return transposed;
+      }
+      return grid;
+    } catch {
+      return grid;
+    }
+  };
+
+  // Simple transpose helper for 5x5 grids
+  const transposeGrid = (grid) => {
+    try {
+      if (!Array.isArray(grid) || grid.length !== 5) return grid;
+      if (grid.some((row) => !Array.isArray(row) || row.length !== 5))
+        return grid;
+      const t = Array.from({ length: 5 }, (_, r) =>
+        Array.from({ length: 5 }, (_, c) => grid[c][r])
+      );
+      return t;
+    } catch {
+      return grid;
+    }
+  };
+
   // Robust integer parser: handles numbers, numeric strings, and trims extras
   const toInt = (v) => {
     if (typeof v === "number" && Number.isFinite(v)) return v;
@@ -320,6 +391,7 @@ const BingoModals = ({
                         Array.isArray(bingoStatus.winnerCardNumbers) &&
                         Array.isArray(bingoStatus.winnerCardNumbers[0])
                       ) {
+                        // Keep original orientation for winners so indices from backend align
                         cardGrid = bingoStatus.winnerCardNumbers;
                       } else if (
                         bingoStatus.winnerCardNumbers &&
@@ -410,6 +482,16 @@ const BingoModals = ({
                           corners.every(([r, c]) => isMarked(cardGrid[r][c]))
                         ) {
                           return { indices: [0, 4, 20, 24] };
+                        }
+                        // inner corners
+                        const inner = [
+                          [1, 1],
+                          [1, 3],
+                          [3, 1],
+                          [3, 3],
+                        ];
+                        if (inner.every(([r, c]) => isMarked(cardGrid[r][c]))) {
+                          return { indices: [6, 8, 16, 18] };
                         }
                         return { indices: [] };
                       };
@@ -725,7 +807,9 @@ const BingoModals = ({
                       Array.isArray(nonWinnerCardData.cardNumbers) &&
                       Array.isArray(nonWinnerCardData.cardNumbers[0])
                     ) {
-                      cardGrid = nonWinnerCardData.cardNumbers;
+                      cardGrid = normalizeGridOrientation(
+                        nonWinnerCardData.cardNumbers
+                      );
                     } else if (
                       nonWinnerCardData.cardNumbers &&
                       typeof nonWinnerCardData.cardNumbers === "object"
@@ -750,15 +834,26 @@ const BingoModals = ({
                               : Number(flatNumbers[index]);
                         }
                       }
+                      cardGrid = normalizeGridOrientation(cardGrid);
                     } else {
                       cardGrid = Array(5)
                         .fill()
                         .map(() => Array(5).fill("FREE"));
                     }
+                    // User-reported: rows/cols are swapped in non-winner view. Force a transpose for display.
+                    const wasTransposed = true;
+                    cardGrid = transposeGrid(cardGrid);
                     const patternIndices =
                       nonWinnerCardData.patternInfo?.selectedIndices ||
                       nonWinnerCardData.patternInfo?.localSelectedIndices ||
                       [];
+                    const remappedPatternIndices = wasTransposed
+                      ? patternIndices.map((idx) => {
+                          const r = Math.floor(idx / 5);
+                          const c = idx % 5;
+                          return c * 5 + r;
+                        })
+                      : patternIndices;
                     const calledInPattern =
                       nonWinnerCardData.calledNumbersInPattern || [];
                     const otherCalled =
@@ -776,7 +871,7 @@ const BingoModals = ({
                           calledNumbers.includes(num);
                         const isWinningCell =
                           nonWinnerCardData.lateCall &&
-                          patternIndices.includes(cellIndex);
+                          remappedPatternIndices.includes(cellIndex);
                         const displayNum = isFree ? "FREE" : num;
                         const base =
                           "flex items-center justify-center rounded border relative overflow-hidden";

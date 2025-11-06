@@ -454,6 +454,7 @@ export const callNumber = async (req, res, next) => {
           gameId,
           gameNumber: updatedGame?.gameNumber,
           calledNumber: nextNumber,
+          callSource, // include source so clients can decide whether to honor when auto-call is OFF
           playAtEpoch: playAtEpoch || undefined,
           game: {
             _id: gameId,
@@ -553,6 +554,11 @@ export const checkBingo = async (req, res, next) => {
     if (!fullCard?.numbers) {
       return res.status(404).json({ message: "Full card data not found" });
     }
+    // Helper: flatten 5x5 grid (row-major) for client speed
+    const flatten25 = (grid) =>
+      Array.isArray(grid) && grid.length === 5
+        ? grid.flat().map((v) => (v === null ? "FREE" : v))
+        : [];
 
     // 🚨 FIXED: Removed FutureWinner check — now allows any selected card to bingo
     // If needed, add back as optional: const requireScheduled = req.query.requireScheduled === 'true';
@@ -650,6 +656,34 @@ export const checkBingo = async (req, res, next) => {
             },
           ],
           gameStatus: game.status,
+          card: flatten25(fullCard.numbers),
+          patternInfo: (() => {
+            try {
+              const { selectedIndices } = getNumbersForPattern(
+                fullCard.numbers,
+                actualPatternOnRecheck,
+                game.calledNumbers,
+                true,
+                [],
+                true
+              );
+              let rowIndex = null;
+              let colIndex = null;
+              if (selectedIndices && selectedIndices.length === 5) {
+                const rows = selectedIndices.map((i) => Math.floor(i / 5));
+                const cols = selectedIndices.map((i) => i % 5);
+                if (rows.every((r) => r === rows[0])) rowIndex = rows[0];
+                if (cols.every((c) => c === cols[0])) colIndex = cols[0];
+              }
+              return {
+                selectedIndices: selectedIndices || [],
+                rowIndex,
+                colIndex,
+              };
+            } catch {
+              return null;
+            }
+          })(),
         });
       }
 
@@ -678,6 +712,7 @@ export const checkBingo = async (req, res, next) => {
         message: "Pattern not complete",
         winners: [],
         game,
+        card: flatten25(fullCard.numbers),
       });
     }
 
@@ -730,6 +765,36 @@ export const checkBingo = async (req, res, next) => {
           },
         ],
         gameStatus: game.status,
+        card: flatten25(fullCard.numbers),
+        // lightweight pattern info for UI highlights
+        patternInfo: (() => {
+          try {
+            const { numbers: nums, selectedIndices } = getNumbersForPattern(
+              fullCard.numbers,
+              actualPattern,
+              game.calledNumbers,
+              true,
+              [],
+              true
+            );
+            // Derive row/col if applicable
+            let rowIndex = null;
+            let colIndex = null;
+            if (selectedIndices && selectedIndices.length === 5) {
+              const rows = selectedIndices.map((i) => Math.floor(i / 5));
+              const cols = selectedIndices.map((i) => i % 5);
+              if (rows.every((r) => r === rows[0])) rowIndex = rows[0];
+              if (cols.every((c) => c === cols[0])) colIndex = cols[0];
+            }
+            return {
+              selectedIndices: selectedIndices || [],
+              rowIndex,
+              colIndex,
+            };
+          } catch {
+            return null;
+          }
+        })(),
       });
     }
 
@@ -799,6 +864,7 @@ export const checkBingo = async (req, res, next) => {
       isBingo: true,
       winners: [winningCard],
       gameStatus: "completed",
+      card: flatten25(fullCard.numbers),
     });
   } catch (err) {
     console.error("[checkBingo] ❌ ERROR:", err);
