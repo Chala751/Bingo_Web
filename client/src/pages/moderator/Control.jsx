@@ -1,12 +1,11 @@
-import React, { useState, useEffect } from "react";
-import { useNavigate } from "react-router-dom";
+import React, { useState, useEffect, useRef, useCallback } from "react";
+// import { useNavigate } from "react-router-dom";
 import ModeratorLayout from "../../components/moderator/ModeratorLayout";
-import gameService from "../../services/game";
 import moderatorService from "../../services/moderator";
 import { toast } from "react-toastify";
 
 export default function ModeratorDashboard() {
-  const navigate = useNavigate();
+  // Removed unused navigate for performance cleanup
 
   const [activeGames, setActiveGames] = useState([]);
   const [finishedGames, setFinishedGames] = useState([]);
@@ -25,7 +24,8 @@ export default function ModeratorDashboard() {
   const [selectedNumber, setSelectedNumber] = useState("");
   const [callNumberError, setCallNumberError] = useState(null);
   const [callNumberLoading, setCallNumberLoading] = useState(false);
-  const [allCards, setAllCards] = useState([]);
+  // Removed heavy allCards usage (was dropdown); numeric input now used.
+  const [cashierId, setCashierId] = useState(null);
   const [futureWinnerModalOpen, setFutureWinnerModalOpen] = useState(false);
   const [futureWinners, setFutureWinners] = useState([
     { gameNumber: "", cardId: "", jackpotEnabled: true, pattern: "all" },
@@ -40,130 +40,186 @@ export default function ModeratorDashboard() {
     pattern: "all",
   });
 
+  // Cache cashier info/id to avoid re-fetching every poll
+  const fetchingRef = useRef(false);
   const fetchCashierInfo = async () => {
     try {
       const response = await moderatorService.getPairedCashier();
-      console.log("[fetchCashierInfo] Response:", response);
       setCashierInfo(response);
+      setCashierId(response.cashierId);
       return response.cashierId;
     } catch (err) {
       console.error("[fetchCashierInfo] Error:", err);
       setError("Failed to fetch cashier information. Please try again.");
-      throw err;
+      throw err; // propagate so caller can decide to abort fetchGames
     }
   };
 
-  const fetchGames = async (background = false) => {
-    if (!background) {
-      setLoading(true);
-    }
-    setError(null);
+  // Lightweight deep compare via stable JSON; memoize last snapshot to avoid stringifying on every poll
+  const lastSnapshotRef = useRef({
+    active: null,
+    finished: null,
+    pending: null,
+    configured: null,
+  });
+  const stableStringify = (obj) => {
     try {
-      const cashierId = await fetchCashierInfo();
-      console.log("[fetchGames] Fetched cashierId:", cashierId);
-      if (!cashierId) {
-        throw new Error("No cashierId returned from fetchCashierInfo");
-      }
+      return JSON.stringify(obj);
+    } catch {
+      return "";
+    }
+  };
 
-      console.log("[fetchGames] Fetching report for cashierId:", cashierId);
-      const report = await moderatorService.getCashierReport(cashierId);
-      console.log("[fetchGames] Fetched report:", report);
-      const allGames = report.games || [];
-      if (!Array.isArray(allGames)) {
-        throw new Error("No valid games data returned from service");
-      }
-      console.log(
-        "[fetchGames] Game details:",
-        allGames.map((g) => ({
-          _id: g._id,
-          gameNumber: g.gameNumber,
-          status: g.status,
-          moderatorWinnerCardId: g.moderatorWinnerCardId,
-        }))
-      );
+  const applyGameLists = useCallback((allGames, futureWinnersResp) => {
+    const nextActive = allGames.filter((g) => g.status === "active");
+    const nextFinished = allGames.filter(
+      (g) => g.status === "finished" || g.status === "completed"
+    );
+    const nextPending = allGames.filter((g) => g.status === "pending");
 
-      setActiveGames(allGames.filter((g) => g.status === "active"));
-      setFinishedGames(
-        allGames.filter(
-          (g) => g.status === "finished" || g.status === "completed"
-        )
-      );
-      setPendingGames(allGames.filter((g) => g.status === "pending"));
+    const futureWinners = Array.isArray(futureWinnersResp)
+      ? futureWinnersResp
+      : [];
+    const configuredFutureWinners = futureWinners.filter((winner) => {
+      const game = allGames.find((g) => g.gameNumber === winner.gameNumber);
+      return !game || game.status === "pending";
+    });
+    const nextConfigured = configuredFutureWinners.map((winner) => ({
+      _id: winner._id,
+      gameNumber: winner.gameNumber,
+      cardId: winner.cardId,
+      pattern: winner.pattern || "Not set",
+      jackpotEnabled: winner.jackpotEnabled,
+      status: allGames.find((g) => g.gameNumber === winner.gameNumber)
+        ? "pending"
+        : "not created",
+    }));
 
-      let futureWinners = [];
-      try {
-        console.log(
-          "[fetchGames] Fetching future winners for cashierId:",
-          cashierId
-        );
-        futureWinners = await moderatorService.getFutureWinners(cashierId);
-        console.log("[fetchGames] Fetched future winners:", futureWinners);
-      } catch (err) {
-        console.warn(
-          "[fetchGames] Failed to fetch future winners, using empty array:",
-          {
-            message: err.message,
-            response: err.response?.data,
-          }
-        );
-        futureWinners = [];
-      }
+    const snapshot = {
+      active: stableStringify(nextActive),
+      finished: stableStringify(nextFinished),
+      pending: stableStringify(nextPending),
+      configured: stableStringify(nextConfigured),
+    };
+    const last = lastSnapshotRef.current;
+    if (last.active !== snapshot.active) setActiveGames(nextActive);
+    if (last.finished !== snapshot.finished) setFinishedGames(nextFinished);
+    if (last.pending !== snapshot.pending) setPendingGames(nextPending);
+    if (last.configured !== snapshot.configured)
+      setConfiguredWinnerGames(nextConfigured);
+    lastSnapshotRef.current = snapshot;
+  }, []);
 
-      const configuredFutureWinners = futureWinners.filter((winner) => {
-        const game = allGames.find((g) => g.gameNumber === winner.gameNumber);
-        return !game || game.status === "pending";
-      });
-
-      setConfiguredWinnerGames(
-        configuredFutureWinners.map((winner) => ({
-          _id: winner._id,
-          gameNumber: winner.gameNumber,
-          cardId: winner.cardId,
-          pattern: winner.pattern || "Not set",
-          jackpotEnabled: winner.jackpotEnabled,
-          status: allGames.find((g) => g.gameNumber === winner.gameNumber)
-            ? "pending"
-            : "not created",
-        }))
-      );
-    } catch (err) {
-      const errorMessage =
-        err.message ||
-        "Failed to fetch games or future winners. Please try again.";
-      setError(errorMessage);
-      console.error("[fetchGames] Detailed Error:", {
-        message: err.message,
-        stack: err.stack,
-        response: err.response
-          ? { status: err.response.status, data: err.response.data }
-          : null,
-      });
-    } finally {
+  const fetchGames = useCallback(
+    async (background = false) => {
       if (!background) {
-        setLoading(false);
+        setLoading(true);
       }
-    }
-  };
+      setError(null);
+      try {
+        if (background && fetchingRef.current) {
+          // Skip if a background fetch is still in-flight
+          return;
+        }
+        fetchingRef.current = true;
+        // Only fetch cashier once; reuse cached id afterwards
+        let cId = cashierId;
+        if (!cId) {
+          cId = await fetchCashierInfo();
+        }
+        if (!cId) {
+          throw new Error("No cashierId returned from fetchCashierInfo");
+        }
+        // Abort controller to cancel slow overlapping polls
+        if (!fetchGames.abortRef) fetchGames.abortRef = { controller: null };
+        try {
+          fetchGames.abortRef.controller?.abort?.();
+        } catch (e) {
+          // ignore abort errors
+        }
+        const controller = new AbortController();
+        fetchGames.abortRef.controller = controller;
 
-  const fetchAllCards = async () => {
-    try {
-      const cards = await gameService.getAllCards();
-      console.log("[fetchAllCards] Fetched cards:", cards);
-      setAllCards(cards);
-    } catch (err) {
-      console.error("[fetchAllCards] Failed to fetch cards:", err);
-      setError("Failed to fetch cards. Please try again.");
-    }
-  };
+        const reportPromise = moderatorService.getCashierReport(cId);
+        const futurePromise = (async () => {
+          try {
+            return await moderatorService.getFutureWinners(cId);
+          } catch (err) {
+            console.warn(
+              "[fetchGames] Failed to fetch future winners, using empty array:",
+              { message: err.message, response: err.response?.data }
+            );
+            return [];
+          }
+        })();
+        const [report, futureWinnersResp] = await Promise.all([
+          reportPromise,
+          futurePromise,
+        ]);
+
+        const allGames = report.games || [];
+        if (!Array.isArray(allGames)) {
+          throw new Error("No valid games data returned from service");
+        }
+        applyGameLists(allGames, futureWinnersResp);
+      } catch (err) {
+        const errorMessage =
+          err.message ||
+          "Failed to fetch games or future winners. Please try again.";
+        setError(errorMessage);
+        console.error("[fetchGames] Detailed Error:", {
+          message: err.message,
+          stack: err.stack,
+          response: err.response
+            ? { status: err.response.status, data: err.response.data }
+            : null,
+        });
+      } finally {
+        if (!background) {
+          setLoading(false);
+        }
+      }
+      fetchingRef.current = false;
+    },
+    [cashierId, applyGameLists]
+  );
 
   useEffect(() => {
+    let mounted = true;
+    // initial load
     fetchGames(false);
-    fetchAllCards();
-    const intervalId = setInterval(() => {
-      fetchGames(true);
-    }, 5000);
-    return () => clearInterval(intervalId);
-  }, []);
+    // Adaptive polling: slow when hidden, fast when focused
+    const baseInterval = 5000;
+    let intervalMs = baseInterval;
+    const tick = () => {
+      if (!mounted) return;
+      if (!document.hidden) {
+        fetchGames(true);
+        intervalMs = baseInterval; // reset to normal when visible
+      } else {
+        intervalMs = 15000; // slow polling in background
+      }
+      schedule();
+    };
+    let intervalId;
+    const schedule = () => {
+      clearTimeout(intervalId);
+      intervalId = setTimeout(tick, intervalMs);
+    };
+    schedule();
+    const onVisible = () => {
+      if (!document.hidden) {
+        intervalMs = baseInterval;
+        fetchGames(true);
+      }
+    };
+    document.addEventListener("visibilitychange", onVisible);
+    return () => {
+      mounted = false;
+      clearTimeout(intervalId);
+      document.removeEventListener("visibilitychange", onVisible);
+    };
+  }, [fetchGames]);
 
   const handleToggleJackpot = async (gameId, currentEnabled) => {
     setLoading(true);
@@ -927,21 +983,15 @@ export default function ModeratorDashboard() {
                   <label className="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-2">
                     Winning Card ID
                   </label>
-                  <select
+                  <input
+                    type="number"
+                    min="1"
                     value={selectedWinnerId}
                     onChange={(e) => setSelectedWinnerId(e.target.value)}
                     className="w-full p-3 border border-gray-300 dark:border-gray-600 rounded-lg focus:ring-2 focus:ring-indigo-500 focus:border-indigo-500 transition-all bg-white dark:bg-gray-700 text-gray-900 dark:text-gray-100"
                     disabled={modalLoading}
-                  >
-                    <option value="">Select Card ID</option>
-                    {pendingGames
-                      .find((g) => g._id === modalGameId)
-                      ?.selectedCards.map((card) => (
-                        <option key={card.id} value={card.id}>
-                          Card #{card.id}
-                        </option>
-                      ))}
-                  </select>
+                    placeholder="Enter winning card number"
+                  />
                 </div>
                 <div className="flex justify-end space-x-4">
                   <button
@@ -1110,21 +1160,17 @@ export default function ModeratorDashboard() {
                         <label className="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-2">
                           Winning Card Number
                         </label>
-                        <select
+                        <input
+                          type="number"
                           value={winner.cardId}
                           onChange={(e) =>
                             handleWinnerChange(index, "cardId", e.target.value)
                           }
                           className="w-full p-3 border border-gray-300 dark:border-gray-600 rounded-lg focus:ring-2 focus:ring-indigo-500 focus:border-indigo-500 transition-all bg-white dark:bg-gray-700 text-gray-900 dark:text-gray-100"
                           disabled={modalLoading}
-                        >
-                          <option value="">Select Card Number</option>
-                          {allCards.map((card) => (
-                            <option key={card._id} value={card.card_number}>
-                              Card #{card.card_number}
-                            </option>
-                          ))}
-                        </select>
+                          min="1"
+                          placeholder="Enter card number"
+                        />
                       </div>
                       <div>
                         <label className="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-2">
@@ -1257,7 +1303,8 @@ export default function ModeratorDashboard() {
                   <label className="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-2">
                     Winning Card Number
                   </label>
-                  <select
+                  <input
+                    type="number"
                     value={reconfigureForm.cardId}
                     onChange={(e) =>
                       setReconfigureForm({
@@ -1267,14 +1314,9 @@ export default function ModeratorDashboard() {
                     }
                     className="w-full p-3 border border-gray-300 dark:border-gray-600 rounded-lg focus:ring-2 focus:ring-indigo-500 focus:border-indigo-500 transition-all bg-white dark:bg-gray-700 text-gray-900 dark:text-gray-100"
                     disabled={modalLoading}
-                  >
-                    <option value="">Select Card Number</option>
-                    {allCards.map((card) => (
-                      <option key={card._id} value={card.card_number}>
-                        Card #{card.card_number}
-                      </option>
-                    ))}
-                  </select>
+                    min="1"
+                    placeholder="Enter card number"
+                  />
                 </div>
                 <div>
                   <label className="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-2">

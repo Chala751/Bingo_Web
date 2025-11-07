@@ -238,19 +238,7 @@ const BingoModals = ({
   };
 
   // Simple transpose helper for 5x5 grids
-  const transposeGrid = (grid) => {
-    try {
-      if (!Array.isArray(grid) || grid.length !== 5) return grid;
-      if (grid.some((row) => !Array.isArray(row) || row.length !== 5))
-        return grid;
-      const t = Array.from({ length: 5 }, (_, r) =>
-        Array.from({ length: 5 }, (_, c) => grid[c][r])
-      );
-      return t;
-    } catch {
-      return grid;
-    }
-  };
+  // Removed transposeGrid (no longer needed after orientation fix)
 
   // Robust integer parser: handles numbers, numeric strings, and trims extras
   const toInt = (v) => {
@@ -840,20 +828,13 @@ const BingoModals = ({
                         .fill()
                         .map(() => Array(5).fill("FREE"));
                     }
-                    // User-reported: rows/cols are swapped in non-winner view. Force a transpose for display.
-                    const wasTransposed = true;
-                    cardGrid = transposeGrid(cardGrid);
+                    // FIX: Previously we forced a transpose which flipped rows/cols.
+                    // Remove transpose; display the grid as-is and keep indices consistent.
                     const patternIndices =
                       nonWinnerCardData.patternInfo?.selectedIndices ||
                       nonWinnerCardData.patternInfo?.localSelectedIndices ||
                       [];
-                    const remappedPatternIndices = wasTransposed
-                      ? patternIndices.map((idx) => {
-                          const r = Math.floor(idx / 5);
-                          const c = idx % 5;
-                          return c * 5 + r;
-                        })
-                      : patternIndices;
+                    const remappedPatternIndices = patternIndices; // no remap needed now
                     const calledInPattern =
                       nonWinnerCardData.calledNumbersInPattern || [];
                     const otherCalled =

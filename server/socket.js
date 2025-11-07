@@ -42,6 +42,123 @@ export const initSocket = (server) => {
         const { gameId } = payload || {};
         if (!gameId) return;
 
+        // Deferred scheduling support: if a future playAtEpoch is provided, queue a single
+        // execution for that time to avoid bursts and race conditions.
+        const playAtEpoch = Number.isFinite(payload?.playAtEpoch)
+          ? payload.playAtEpoch
+          : null;
+        const nowEpoch = Date.now();
+        const isFuture = playAtEpoch && playAtEpoch - nowEpoch > 400; // treat >400ms as deferred
+
+        // Shared maps (persisted on io)
+        const deferred = io._deferredCalls || (io._deferredCalls = new Map());
+        const callInProgressMap =
+          io._callInProgress || (io._callInProgress = new Map());
+
+        // If already in-flight, reject immediately
+        if (callInProgressMap.get(gameId)) {
+          console.warn(
+            `[socket:requestNextCall] Rejected duplicate request for game ${gameId}: call already in progress.`
+          );
+          socket.emit("requestNextCallResult", {
+            gameId,
+            status: "ERROR",
+            httpStatus: 429,
+            message: "Call already in progress. Please wait.",
+            errorCode: "CALL_IN_PROGRESS",
+          });
+          return;
+        }
+
+        // If a deferred call already exists, acknowledge and do nothing
+        const existingDeferred = deferred.get(gameId);
+        if (existingDeferred) {
+          socket.emit("requestNextCallResult", {
+            gameId,
+            status: "ALREADY_SCHEDULED",
+            nextPlayAt: playAtEpoch || null,
+            message: "A deferred call is already scheduled.",
+          });
+          return;
+        }
+
+        if (isFuture) {
+          const delay = Math.max(0, playAtEpoch - nowEpoch);
+          const timeoutId = setTimeout(async () => {
+            // Clear marker first to allow rescheduling if needed
+            deferred.delete(gameId);
+            if (callInProgressMap.get(gameId)) return;
+            callInProgressMap.set(gameId, true);
+            try {
+              const req = {
+                params: { gameId },
+                body: {
+                  playAtEpoch,
+                  minIntervalMs: Number.isFinite(payload?.minIntervalMs)
+                    ? payload.minIntervalMs
+                    : undefined,
+                },
+                headers: {},
+              };
+              const result = await new Promise((resolve, reject) => {
+                const res = {
+                  status(code) {
+                    this._status = code;
+                    return this;
+                  },
+                  json(obj) {
+                    resolve({ status: this._status || 200, data: obj });
+                  },
+                };
+                httpCallNumber(req, res, (err) => {
+                  if (err) reject(err);
+                }).catch(reject);
+              });
+              if (result?.status >= 400) {
+                const code = result?.data?.errorCode;
+                if (
+                  code === "TOO_EARLY" &&
+                  Number.isFinite(result?.data?.nextAllowedAt)
+                ) {
+                  socket.emit("requestNextCallResult", {
+                    gameId,
+                    status: "TOO_EARLY",
+                    nextAllowedAt: Number(result.data.nextAllowedAt),
+                  });
+                } else {
+                  socket.emit("requestNextCallResult", {
+                    gameId,
+                    status: "ERROR",
+                    httpStatus: result?.status || 500,
+                    message: result?.data?.message || "Failed",
+                    errorCode: code || null,
+                  });
+                }
+              }
+            } catch (e) {
+              console.warn(
+                "[socket:requestNextCall] Deferred call failed:",
+                e?.message || e
+              );
+              socket.emit("requestNextCallResult", {
+                gameId,
+                status: "ERROR",
+                message: "Deferred call failed",
+              });
+            } finally {
+              callInProgressMap.set(gameId, false);
+            }
+          }, delay);
+          deferred.set(gameId, timeoutId);
+          socket.emit("requestNextCallResult", {
+            gameId,
+            status: "SCHEDULED",
+            playAtEpoch,
+            delayMs: delay,
+          });
+          return;
+        }
+
         // If a call for this game is already in progress, reject the new request.
         if (callInProgress.get(gameId)) {
           console.warn(

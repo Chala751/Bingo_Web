@@ -79,7 +79,10 @@ export const requestNextCall = ({
   if (!gameId) return false;
   const now = Date.now();
   const last = nextCallGate.get(gameId) || 0;
-  if (now - last < 1200) {
+  const guard = Number.isFinite(minIntervalMs)
+    ? Math.max(600, Math.min(minIntervalMs - 300, minIntervalMs))
+    : 1200;
+  if (now - last < guard) {
     return false;
   }
   nextCallGate.set(gameId, now);

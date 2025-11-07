@@ -514,14 +514,25 @@ export default function useAutoCaller({
         // Advance tick now that server confirmed
         tickRef.current += 1;
 
-        // Optionally re-anchor to the acknowledged play time to avoid catch-up bursts
+        // Optionally re-anchor to the acknowledged play time to avoid catch-up bursts.
+        // IMPORTANT: If the acknowledged scheduled time (atMs) is significantly
+        // in the past relative to now (i.e. network / server delay), we DO NOT
+        // try to "catch up" by shortening the next interval. Instead we treat
+        // the actual arrival time (now) as the play time to preserve a stable cadence.
+        const now = performance.now();
+        let effectivePlayAtMs = now;
         if (typeof atMs === "number" && isFinite(atMs)) {
-          // Anchor to align past tick to its intended play moment
-          anchorMsRef.current = atMs - (tickRef.current - 1) * intervalMs;
-          lastPlayAtMsRef.current = atMs;
-        } else {
-          lastPlayAtMsRef.current = performance.now();
+          // If the provided atMs is only slightly earlier (<=100ms), trust it for precision.
+          // Otherwise, ignore stale schedule to avoid compressed next interval.
+          const lateness = now - atMs;
+          if (lateness <= 100) {
+            effectivePlayAtMs = atMs;
+          }
         }
+        // Recompute anchor based on the EFFECTIVE play time of the tick we just finished.
+        anchorMsRef.current =
+          effectivePlayAtMs - (tickRef.current - 1) * intervalMs;
+        lastPlayAtMsRef.current = effectivePlayAtMs;
 
         let nextTarget = anchorMsRef.current + tickRef.current * intervalMs;
         // Enforce constant interval spacing: next target must be at least lastPlay + interval

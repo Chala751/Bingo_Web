@@ -236,11 +236,9 @@ export const callNumber = async (req, res, next) => {
             }
             if (Number.isFinite(earliest)) {
               const nowTs = Date.now();
-              const candidatePlayAt = providedPlayAtEpoch || null;
-              const allowsEarly =
-                typeof candidatePlayAt === "number" &&
-                candidatePlayAt >= earliest;
-              if (!allowsEarly && nowTs < earliest - 10) {
+              // IMPORTANT: Do NOT consider providedPlayAtEpoch for interval gating.
+              // Emission occurs NOW; providedPlayAtEpoch only helps clients schedule audio.
+              if (nowTs < earliest - 10) {
                 await Game.findByIdAndUpdate(gameId, {
                   $unset: { callLock: "" },
                 });
@@ -380,13 +378,14 @@ export const callNumber = async (req, res, next) => {
 
     let updatedGame = afterAdd;
     if (afterAdd?.calledNumbers?.includes(nextNumber)) {
+      // Log the ACTUAL emit time (Date.now()), not the scheduled playAtEpoch.
       const pushLogUpdate = await Game.findByIdAndUpdate(
         gameId,
         {
           $push: {
             calledNumbersLog: {
               number: nextNumber,
-              calledAt: new Date(providedPlayAtEpoch || Date.now()),
+              calledAt: new Date(Date.now()),
             },
           },
         },
@@ -421,9 +420,8 @@ export const callNumber = async (req, res, next) => {
         updatedGame?.cashierId?.toString() || lockDoc?.cashierId?.toString();
       if (cashierRoom) {
         const playAtEpoch = providedPlayAtEpoch || null;
-        const effectiveEmitTs = Number.isFinite(playAtEpoch)
-          ? playAtEpoch
-          : Date.now();
+        // Effective emit timestamp is always NOW; do not let future playAtEpoch distort pacing.
+        const effectiveEmitTs = Date.now();
         try {
           lastEmitAtByGame.set(gameId, effectiveEmitTs);
         } catch {}
@@ -455,7 +453,7 @@ export const callNumber = async (req, res, next) => {
           gameNumber: updatedGame?.gameNumber,
           calledNumber: nextNumber,
           callSource, // include source so clients can decide whether to honor when auto-call is OFF
-          playAtEpoch: playAtEpoch || undefined,
+          playAtEpoch: playAtEpoch || undefined, // advisory for client-side audio scheduling ONLY
           game: {
             _id: gameId,
             gameNumber: updatedGame?.gameNumber,
